@@ -1,0 +1,53 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "quill-sort"
+version         = "4.0.4"
+description     = "Adaptive ultra-sort: the fastest general-purpose sorting library for Python"
+readme          = "README.md"
+license         = { text = "MIT" }
+authors         = [{ name = "Isaiah Tucker" }]
+requires-python = ">=3.8"
+
+keywords = [
+  "sorting", "sort", "algorithm", "radix sort",
+  "fast sort", "high performance", "numpy"
+]
+
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Scientific/Engineering",
+]
+
+# numpy is optional but strongly recommended
+dependencies = []
+
+[project.optional-dependencies]
+fast    = ["numpy>=1.21", "psutil>=5.9"]
+pandas  = ["numpy>=1.21", "pandas>=1.3"]
+all     = ["numpy>=1.21", "pandas>=1.3", "psutil>=5.9"]
+
+[project.scripts]
+quill = "quill.__main__:main"
+
+[project.urls]
+Homepage   = "https://github.com/invariant-games/quill"
+Repository = "https://github.com/invariant-games/quill"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+quill = ["py.typed"]
