@@ -7,54 +7,66 @@ on:
     branches: [ main ]
 
 jobs:
-  test-and-validate:
-    name: Validate Changes
+  full-validation:
+    name: Full Validation Gauntlet
     runs-on: ubuntu-latest
 
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      PYTHON_VERSION: "3.13"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: Install project (with fast extras) and tools
+      - name: Install project and tooling
         run: |
-          pip install .[fast] pytest pytest-cov
-          pip install mypy ruff build
+          # Install project with fast extras
+          pip install .[fast]
+          # Core tooling
+          pip install pytest pytest-cov mypy ruff build twine
 
-      # ---- Linting (style + basic static analysis) ----
-      - name: Lint with ruff
+      # ---------- Linting + style ----------
+      - name: Lint with ruff (entire repo)
         run: |
           ruff check .
 
-      # ---- Type checking ----
+      # ---------- Type checking ----------
       - name: Type check with mypy
         run: |
-          mypy quill || true
-        # remove "|| true" once your type hints are fully clean
+          # Adjust package/module name as needed
+          mypy quill
 
-      # ---- Tests ----
+      # ---------- Unit + integration tests ----------
       - name: Run tests with coverage
         run: |
-          pytest -q --maxfail=1 --disable-warnings --cov=quill --cov-report=term-missing
+          # If you have a tests/ folder, this will discover everything
+          pytest -q \
+            --maxfail=1 \
+            --disable-warnings \
+            --cov=quill \
+            --cov-report=term-missing
 
-      # ---- Packaging sanity check ----
-      - name: Build package
+      # ---------- Heavy internal test suite (optional but recommended) ----------
+      # If you ship a dedicated internal test harness like quill_test_suite.py
+      # uncomment and adjust this step.
+      #
+      # - name: Run Quill internal test suite
+      #   run: |
+      #     python quill_test_suite.py --fast --bench
+
+      # ---------- Packaging sanity ----------
+      - name: Build distribution artifacts
         run: |
           python -m build
 
-      - name: Check built artifacts with twine (optional)
+      - name: Validate built artifacts with twine
         run: |
-          pip install twine
           twine check dist/*
