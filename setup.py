@@ -142,8 +142,12 @@ def _build_ext_modules() -> list:
     except BaseException:
         if isinstance(sys.exc_info()[1], (KeyboardInterrupt, SystemExit, GeneratorExit)):
             raise
-        if force:
-            raise
+        # The numpy-backed exts are a SECONDARY list-path optimization. When numpy
+        # isn't importable at build time — e.g. cibuildwheel's isolated build env,
+        # which has no numpy — we skip them even under QUILL_FORCE_C_EXT. The
+        # binary wheel must carry the numpy-free native backend (quill._native,
+        # forced above); these two are a bonus built only where numpy is present
+        # (source installs, or a build env that provides it).
 
     return exts
 

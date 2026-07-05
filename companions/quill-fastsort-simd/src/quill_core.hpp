@@ -153,7 +153,10 @@ void parallel_partition_sort(T* a, size_t n, int K,
 
     // chunk boundaries
     std::vector<size_t> cstart(P + 1);
-    for (int p = 0; p <= P; ++p) cstart[p] = (size_t)((__int128)n * p / P);
+    // 64-bit math (n*P stays well under 2^64 for any real sort); avoids __int128,
+    // which MSVC does not support.
+    for (int p = 0; p <= P; ++p)
+        cstart[p] = (size_t)((unsigned long long)n * (unsigned long long)p / (unsigned long long)P);
 
     // per-thread histograms: hist[p*K + b]
     std::vector<size_t> hist((size_t)P * K, 0);
@@ -248,7 +251,9 @@ void parallel_samplesort(T* a, size_t n, int nthreads = 0) {
     if (S >= n) { serial_sort<T>(a, n); return; }
     std::vector<T> sample(S);
     // deterministic stride sampling (no RNG → reproducible, resume-safe)
-    for (size_t i = 0; i < S; ++i) sample[i] = a[(size_t)((__int128)n * (i + 1) / (S + 1))];
+    for (size_t i = 0; i < S; ++i)
+        sample[i] = a[(size_t)((unsigned long long)n * (unsigned long long)(i + 1)
+                               / (unsigned long long)(S + 1))];
     std::sort(sample.begin(), sample.end());
     std::vector<T> split(K - 1);
     for (int i = 0; i < K - 1; ++i) split[i] = sample[(size_t)(i + 1) * oversample - 1];

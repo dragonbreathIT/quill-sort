@@ -19,6 +19,7 @@
 // Windows); the only platform-specific code is numa_topology()'s Linux sysfs probe.
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <cstdio>          // snprintf (numa_topology)
 #include "quill_core.hpp"
 
 #if defined(__linux__)
