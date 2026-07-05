@@ -116,6 +116,16 @@ class Backend:
     # in-place radix/partition backends keep True. Used by dispatch_sort to copy
     # the caller's array only when a mutating backend will actually run.
     mutates_input: bool = True
+    # Does this backend place NaN exactly like np.sort (NaN to the end,
+    # ascending) with no crash? Only backends whose kernel IS numpy's own sort
+    # (numpy, x86_simd_sort, arm_neon_sort — all ``arr.sort()``) qualify. For
+    # those, dispatch_sort SKIPS the O(n) NaN pre-scan entirely and lets the
+    # kernel order NaN natively — a measured ~11% win on float sorts whose best
+    # backend is just numpy's kernel. Radix/parallel backends (voracious, ips4o,
+    # polars, …) stay False: they panic on or misorder NaN, so the dispatcher
+    # must strip NaN before handing them the data. Default False = always strip
+    # (the safe, pre-existing behavior).
+    nan_safe: bool = False
 
     def __init__(self) -> None:
         self._available: Optional[bool] = None
@@ -205,6 +215,7 @@ class NumpySortBackend(Backend):
     kinds = "iuf"
     max_itemsize = 8
     mutates_input = False  # np.sort returns a fresh array; never touches input
+    nan_safe = True        # IS np.sort — orders NaN to the end natively
 
     def _probe(self) -> bool:
         return _NUMPY
@@ -810,10 +821,90 @@ class SimdCompanionBackend(Backend):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Spectre backend  (bundled parallel integer radix — quill._spectre)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SpectreBackend(Backend):
+    """Spectre: a bundled, portable, multi-threaded MSD→LSD radix sort for
+    32/64-bit integers (``quill._spectre``, built from _native_src/spectre_sort.c).
+
+    Integer-only by design (no float kernel). On the reference 24-core box it is
+    the fastest CPU backend for int64/uint64 at every measured size — ~1.3–1.9×
+    over the next-best compiled backend (ips4o / rust_parallel_radix) and up to
+    ~5× over np.sort — and usually wins for int32/uint32 too. It does NOT win
+    everywhere (e.g. int32 around 5M, where the Rust radix is faster), which is
+    exactly why it is a self-tuning *candidate* rather than a hard override: the
+    dispatcher measures it per (dtype, size) bucket and keeps whichever backend
+    actually wins there. Its top static priority only sets the a-priori guess used
+    when tuning is disabled.
+
+    Spectre supports n < 2^32; larger arrays return SPECTRE_TOO_BIG, so
+    ``supports`` refuses them and the chain handles them with another backend.
+    Any Spectre error is raised out of the C wrapper and caught by dispatch_sort's
+    never-lose fallback to np.sort.
+    """
+
+    name = "spectre"
+    priority = 101          # a-priori top integer candidate (see class docstring)
+    min_n = 1_000_000       # measured clean wins from 1M up; below this, other
+                            # backends / np.sort own the range
+    kinds = "iu"            # integers only — Spectre has no float kernel
+    max_itemsize = 8
+    mutates_input = True
+
+    # Spectre's 2^32 element ceiling (SPECTRE_TOO_BIG above this).
+    _MAX_N = 1 << 32
+    _SUPPORTED_DTYPES = ("int64", "uint64", "int32", "uint32")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._mod = None
+
+    def _probe(self) -> bool:
+        # QUILL_NO_SPECTRE=1 disables the backend without a rebuild (parity with
+        # the other opt-out env switches; handy for A/B measurement).
+        if os.environ.get("QUILL_NO_SPECTRE") == "1":
+            return False
+        try:
+            from . import _spectre as m
+        except Exception:
+            return False
+        # Require every kernel we dispatch to, so a partial/older build can't
+        # half-register and then AttributeError inside _sort_ascending.
+        if all(hasattr(m, fn) for fn in
+               ("spectre_i64", "spectre_u64", "spectre_i32", "spectre_u32")):
+            self._mod = m
+            return True
+        return False
+
+    def supports(self, arr) -> bool:
+        if arr.size < self.min_n or arr.size >= self._MAX_N:
+            return False
+        return arr.dtype.name in self._SUPPORTED_DTYPES
+
+    def _sort_ascending(self, arr):
+        m = self._mod
+        n = arr.dtype.name
+        debug = bool(os.environ.get("QUILL_BACKEND_DEBUG"))
+        if debug:
+            print(f"[quill] spectre → {n} (n={arr.size})", file=sys.stderr)
+        if n == "int64":
+            m.spectre_i64(arr)
+        elif n == "uint64":
+            m.spectre_u64(arr)
+        elif n == "int32":
+            m.spectre_i32(arr)
+        elif n == "uint32":
+            m.spectre_u32(arr)
+        return arr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Registry + dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
 _BACKENDS: List[Backend] = [
+    SpectreBackend(),
     Ips4oBackend(),
     RustParallelRadixBackend(),
     RustBackend(),
@@ -1048,6 +1139,37 @@ def _has_any_nan(arr) -> bool:
     return False
 
 
+def _choose_backend(work, force: Optional[str]):
+    """Pick the backend ``dispatch_sort`` will run for *work* (or None → np.sort
+    floor). The choice is VALUE-INDEPENDENT — it keys only off dtype/size — so it
+    can be made BEFORE NaN stripping, letting the dispatcher decide whether the
+    NaN pre-scan is needed at all. Honors ``force`` (exact backend name), else the
+    self-tuning explore-then-exploit pick, degrading to the static priority order
+    if the tuning DB is unavailable."""
+    if force is not None:
+        with _REGISTRY_LOCK:
+            for b in _BACKENDS:
+                if b.name == force and b.available() and b.supports(work):
+                    return b
+        return None
+    try:
+        from ._tuning import DB
+        with _REGISTRY_LOCK:
+            ordered = sorted(_BACKENDS, key=lambda b: b.priority, reverse=True)
+        candidates = [b for b in ordered if b.available() and b.supports(work)]
+        best_name = DB.choose([b.name for b in candidates],
+                              work.dtype.kind, work.size)
+        if best_name is not None:
+            # measured winner first, original priority for the rest
+            chosen = ([b for b in candidates if b.name == best_name]
+                      + [b for b in candidates if b.name != best_name])
+            return chosen[0] if chosen else None
+        return candidates[0] if candidates else None
+    except Exception:
+        # Tuning lookup must NEVER block dispatch — degrade to static priority.
+        return _pick_backend(work)
+
+
 def dispatch_sort(arr, descending: bool = False, force: Optional[str] = None,
                   preserve: bool = False,
                   nan_hint: Optional[bool] = None):
@@ -1072,22 +1194,16 @@ def dispatch_sort(arr, descending: bool = False, force: Optional[str] = None,
         usual NaN-free case) before paying for a full mask.
     """
     _ensure_simd_registered()
-    # strip NaN once (float only); backends never see NaN
-    nan_count = 0
-    work = arr
-    if arr.dtype.kind == "f" and nan_hint is not False:
-        # Skip mask construction entirely when the caller asserted no NaN.
-        # In the unknown case, the chunked probe almost always returns False
-        # after one chunk, sparing the full O(n) mask allocation.
-        needs_mask = True if nan_hint is True else _has_any_nan(arr)
-        if needs_mask:
-            nan_mask = np.isnan(arr)
-            if nan_mask.any():
-                nan_count = int(nan_mask.sum())
-                work = arr[~nan_mask]
-
     global _LAST_BACKEND
     debug = bool(os.environ.get("QUILL_BACKEND_DEBUG"))
+    is_float = arr.dtype.kind == "f"
+    # NaN is stripped LAZILY, and only if the chosen backend can't order it like
+    # np.sort (see the deferred block after backend selection). numpy /
+    # x86_simd_sort / arm_neon_sort handle NaN natively, so most float sorts skip
+    # the O(n) pre-scan entirely — a measured ~11% win when the winning backend
+    # is just numpy's own kernel.
+    nan_count = 0
+    work = arr
     sorted_arr = None
     _LAST_BACKEND = None
     if work.size > 1:
@@ -1104,44 +1220,38 @@ def dispatch_sort(arr, descending: bool = False, force: Optional[str] = None,
                 _LAST_BACKEND = "counting"
 
         if sorted_arr is None:
-            backend = None
-            if force is not None:
-                with _REGISTRY_LOCK:
-                    for b in _BACKENDS:
-                        if b.name == force and b.available() and b.supports(work):
-                            backend = b
-                            break
-            else:
-                # Self-tuning: explore-then-exploit. While any eligible
-                # candidate is under-sampled in this (dtype, size) bucket the DB
-                # routes to it so a freshly installed / never-tried backend gets
-                # measured (never starved by a warm incumbent); once all are
-                # warmed up it returns the measured winner. Falls through to the
-                # static priority order only when tuning is disabled.
-                try:
-                    from ._tuning import DB
-                    with _REGISTRY_LOCK:
-                        ordered = sorted(_BACKENDS,
-                                         key=lambda b: b.priority,
-                                         reverse=True)
-                    candidates = [b for b in ordered
-                                  if b.available() and b.supports(work)]
-                    best_name = DB.choose(
-                        [b.name for b in candidates],
-                        work.dtype.kind, work.size,
-                    )
-                    if best_name is not None:
-                        # Reorder: measured winner first, original priority for
-                        # the rest. _pick_backend's first hit becomes our pick.
-                        chosen = ([b for b in candidates if b.name == best_name]
-                                  + [b for b in candidates if b.name != best_name])
-                        backend = chosen[0] if chosen else None
-                    else:
-                        backend = candidates[0] if candidates else None
-                except Exception:
-                    # Tuning lookup must NEVER block dispatch — degrade to the
-                    # static priority order on any failure.
-                    backend = _pick_backend(work)
+            # Select the backend FIRST (value-independent — keys off dtype/size),
+            # so we can decide whether the NaN pre-scan is even required.
+            backend = _choose_backend(work, force)
+
+            # Deferred NaN handling: strip ONLY for a backend that can't order
+            # NaN like np.sort. nan_safe backends (numpy / x86_simd_sort /
+            # arm_neon_sort — whose kernel IS np.sort) place NaN at the end
+            # natively, so skipping the scan saves a measured ~11% on float sorts
+            # whose winner is just numpy's kernel. Radix/parallel backends stay
+            # nan-unsafe and still receive stripped input. (int arrays have no NaN.)
+            #
+            # We TIME the scan and fold it into the recorded latency below, so the
+            # self-tuning DB sees the true cost of choosing a nan-unsafe backend
+            # on float data (sort + scan) vs a nan-safe one (sort only) and
+            # converges to whichever is genuinely cheaper end-to-end.
+            nan_scan_s = 0.0
+            if is_float and nan_hint is not False and backend is not None \
+                    and not getattr(backend, "nan_safe", False):
+                _ts = time.perf_counter()
+                needs_mask = True if nan_hint is True else _has_any_nan(arr)
+                if needs_mask:
+                    nan_mask = np.isnan(arr)
+                    if nan_mask.any():
+                        nan_count = int(nan_mask.sum())
+                        work = arr[~nan_mask]
+                        # Stripping can shrink the array below a heavy backend's
+                        # crossover (or to <=1 element); re-pick on the stripped
+                        # data so we don't run a parallel radix on a handful of
+                        # values — or at all.
+                        backend = (_choose_backend(work, force)
+                                   if work.size > 1 else None)
+                nan_scan_s = time.perf_counter() - _ts
             if backend is not None:
                 try:
                     # The compiled backends sort the buffer in place, so it must
@@ -1158,7 +1268,9 @@ def dispatch_sort(arr, descending: bool = False, force: Optional[str] = None,
                         work = np.array(work)
                     t0 = time.perf_counter()
                     sorted_arr = backend._sort_ascending(work)
-                    elapsed = time.perf_counter() - t0
+                    # Attribute the NaN-scan cost to this backend so the tuner
+                    # accounts for it (0 for nan_safe backends and all ints).
+                    elapsed = time.perf_counter() - t0 + nan_scan_s
                     _LAST_BACKEND = backend.name
                     # Record the measurement for the self-tuning dispatcher.
                     # Telemetry must never raise into the sort path.

@@ -192,6 +192,10 @@ class SimdSortBackend(Backend):
     # arr.sort() (and any future C kernel) sort in place — the dispatcher must
     # copy when ``preserve=True``.
     mutates_input = True
+    # The kernel IS numpy's own ``arr.sort()``, so NaN lands exactly where
+    # np.sort puts it (the end, ascending). The dispatcher can therefore skip its
+    # O(n) NaN pre-scan for this backend and let the kernel handle NaN natively.
+    nan_safe = True
 
     def _probe(self) -> bool:
         if not _NUMPY:

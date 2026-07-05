@@ -77,6 +77,19 @@ def _cpp_link() -> list[str]:
     return [] if sys.platform.startswith("win") else ["-pthread"]
 
 
+def _c_thread_args() -> list[str]:
+    # Spectre (spectre_sort.c) is C11 and multi-threaded (POSIX pthreads / Win32).
+    # It needs the C optimizer flags plus -pthread on POSIX; MSVC links its
+    # threading (Win32) implicitly, so /O2 alone suffices there.
+    if sys.platform.startswith("win"):
+        return ["/O2"]
+    return ["-O3", "-fPIC", "-pthread"]
+
+
+def _c_thread_link() -> list[str]:
+    return [] if sys.platform.startswith("win") else ["-pthread"]
+
+
 def _build_ext_modules() -> list:
     """Return the C/C++ Extensions to compile, or [] for pure-Python.
 
@@ -117,6 +130,29 @@ def _build_ext_modules() -> list:
             extra_compile_args=_cpp_args(),
             extra_link_args=_cpp_link(),
             optional=optional,
+        ))
+    except BaseException:
+        if isinstance(sys.exc_info()[1], (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        if force:
+            raise
+
+    # 1b) Spectre — bundled parallel integer radix sort (quill._spectre). Pure
+    #    C11 via the buffer protocol (no numpy headers), compiled as its OWN
+    #    extension because it is C, not C++, and so cannot share quill._native's
+    #    -std=c++17 flags. Ships in the same binary wheels. Kept optional=True
+    #    unconditionally: it's a newer backend, and a compile hiccup on an exotic
+    #    toolchain must never fail the wheel — SpectreBackend simply reports
+    #    unavailable and dispatch falls through to the other backends / np.sort.
+    try:
+        exts.append(Extension(
+            "quill._spectre",
+            sources=["quill/_native_src/spectre_sort.c",
+                     "quill/_native_src/spectre_py.c"],
+            include_dirs=["quill/_native_src"],
+            extra_compile_args=_c_thread_args(),
+            extra_link_args=_c_thread_link(),
+            optional=True,
         ))
     except BaseException:
         if isinstance(sys.exc_info()[1], (KeyboardInterrupt, SystemExit, GeneratorExit)):

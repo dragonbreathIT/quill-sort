@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "quill-sort"
-version         = "7.4.0"
+version         = "7.5.0"
 description     = "Adaptive sorting that auto-dispatches to the fastest available backend (compiled, GPU, parallel) with a guaranteed numpy/Timsort fallback; Quill.UltraSort engine for billion-element integer workloads."
 readme          = "README.md"
 license         = { text = "MIT" }
@@ -71,7 +71,7 @@ exclude = ["scratch", "scratch.*", "tests", "tests.*", "build", "build.*", "rust
 # box with a toolchain) can recompile the optional extensions via setup.py:
 #   *.c                 -> the numpy-backed list-conv / counting-sort exts
 #   _native_src/*.{cpp,hpp} -> the bundled CPU backends (quill._native)
-quill = ["py.typed", "*.c", "_native_src/*.cpp", "_native_src/*.hpp"]
+quill = ["py.typed", "*.c", "_native_src/*.cpp", "_native_src/*.hpp", "_native_src/*.c", "_native_src/*.h"]
 
 # The compiled CPU fast-sort backends (rust_voracious/rust_parallel_radix/ips4o/
 # numa/simd_companion) are now FOLDED IN as a single bundled extension,
