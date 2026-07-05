@@ -231,7 +231,9 @@ void parallel_radix(T* a, size_t n, int nthreads = 0) {
     using U = typename key_of<T>::U;
     if (nthreads <= 0) nthreads = default_threads();
     constexpr int TOPSHIFT = (sizeof(U) - 1) * 8;
-    auto bucket_of = [](const T& v) -> int {
+    // Capture TOPSHIFT explicitly: MSVC (unlike gcc/clang) refuses to
+    // implicitly use a local constexpr in a no-capture lambda (error C3493).
+    auto bucket_of = [TOPSHIFT](const T& v) -> int {
         return (int)((enc(v) >> TOPSHIFT) & 0xFF);
     };
     auto leaf = [](T* lo, T* hi) { serial_sort<T>(lo, (size_t)(hi - lo)); };

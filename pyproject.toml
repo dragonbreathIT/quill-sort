@@ -88,13 +88,21 @@ quill = ["py.typed", "*.c", "_native_src/*.cpp", "_native_src/*.hpp"]
 # cibuildwheel 4.x requires Python >= 3.9. cp38 (EOL Oct 2024) still installs via
 # the sdist / pure-Python wheel; it just gets no prebuilt binary wheel.
 build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
-skip  = "*_i686 pp*"
+# Skip 32-bit (i686 Linux + win32) and PyPy.
+skip  = "*_i686 pp* *-win32"
 # QUILL_FORCE_C_EXT makes a failed native build FAIL the wheel (a missing backend
 # in a binary wheel is a bug); the sdist path stays graceful (optional=True).
 environment = { QUILL_FORCE_C_EXT = "1" }
 # Prove the shipped wheel actually carries the native backend before publishing.
 test-requires = "numpy"
 test-command = 'python -c "import quill, numpy as np; from quill import _native; a=np.random.randint(0,2**40,300000).astype(np.int64); assert (quill.sort_array(a.copy())==np.sort(a)).all(); assert \"rust_parallel_radix\" in quill.available_backends()"'
+
+[tool.cibuildwheel.linux]
+# numpy 2.x dropped manylinux2014 (its wheels are manylinux_2_28), so the test
+# step would source-build numpy in the old image and fail on its ancient gcc.
+# manylinux_2_28 ships a modern gcc AND matches numpy's wheels.
+manylinux-x86_64-image  = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
 
 [tool.cibuildwheel.macos]
 environment = { QUILL_FORCE_C_EXT = "1", MACOSX_DEPLOYMENT_TARGET = "11.0" }
