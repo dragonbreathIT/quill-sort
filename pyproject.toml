@@ -95,7 +95,9 @@ skip  = "*_i686 pp* *-win32"
 environment = { QUILL_FORCE_C_EXT = "1" }
 # Prove the shipped wheel actually carries the native backend before publishing.
 test-requires = "numpy"
-test-command = 'python -c "import quill, numpy as np; from quill import _native; a=np.random.randint(0,2**40,300000).astype(np.int64); assert (quill.sort_array(a.copy())==np.sort(a)).all(); assert \"rust_parallel_radix\" in quill.available_backends()"'
+# NB: dtype=np.int64 inside randint — on Windows numpy's default int is int32, so
+# 2**40 would overflow before .astype ever runs.
+test-command = 'python -c "import quill, numpy as np; from quill import _native; a=np.random.randint(0,2**40,300000,dtype=np.int64); assert (quill.sort_array(a.copy())==np.sort(a)).all(); assert \"rust_parallel_radix\" in quill.available_backends()"'
 
 [tool.cibuildwheel.linux]
 # numpy 2.x dropped manylinux2014 (its wheels are manylinux_2_28), so the test
