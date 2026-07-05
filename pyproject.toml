@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "quill-sort"
-version         = "4.0.4"
-description     = "Adaptive ultra-sort: the fastest general-purpose sorting library for Python"
+version         = "7.4.0"
+description     = "Adaptive sorting that auto-dispatches to the fastest available backend (compiled, GPU, parallel) with a guaranteed numpy/Timsort fallback; Quill.UltraSort engine for billion-element integer workloads."
 readme          = "README.md"
 license         = { text = "MIT" }
 authors         = [{ name = "Isaiah Tucker" }]
 requires-python = ">=3.8"
 
 keywords = [
-  "sorting", "sort", "algorithm", "radix sort",
-  "fast sort", "high performance", "numpy"
+  "sorting", "sort", "algorithm", "radix sort", "parallel sort",
+  "fast sort", "high performance", "numpy", "gpu", "cupy", "polars"
 ]
 
 classifiers = [
@@ -27,27 +27,86 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: C",
   "Topic :: Software Development :: Libraries",
   "Topic :: Scientific/Engineering",
 ]
 
-# numpy is optional but strongly recommended
+# Core install has ZERO required dependencies — Quill is always correct with the
+# stdlib alone (Timsort) and faster with numpy. Speed backends are opt-in extras.
 dependencies = []
 
+# NOTE: the optional C extensions (``quill._listconv_ext``, ``quill._counting_ext``)
+# are compiled automatically by setup.py when a C toolchain is available at
+# install time — there is no separate ``pip install quill-sort[c-ext]`` extra
+# (such a name would be misleading since the build is auto-detected, not a
+# user-selected dependency set). Installs without a C toolchain transparently
+# fall back to the pure-Python paths.
 [project.optional-dependencies]
+# numpy + accurate RAM sensing — the baseline fast path.
 fast    = ["numpy>=1.21", "psutil>=5.9"]
+# polars backend: a no-compile, cross-platform multi-threaded parallel sort
+# (~2-2.7x vs np.sort on the array path). The recommended "fast for everyone".
+polars  = ["numpy>=1.21", "polars>=0.20"]
+# GPU backend via CuPy (NVIDIA only; pick the wheel matching your CUDA major).
+gpu     = ["numpy>=1.21", "cupy-cuda12x>=13; platform_system!='Darwin'"]
 pandas  = ["numpy>=1.21", "pandas>=1.3"]
-all     = ["numpy>=1.21", "pandas>=1.3", "psutil>=5.9"]
+all     = ["numpy>=1.21", "pandas>=1.3", "psutil>=5.9", "polars>=0.20"]
+dev     = [
+  "pytest>=7.0",
+  "pytest-timeout>=2.1",
+  "hypothesis>=6.0",
+]
 
 [project.scripts]
 quill = "quill.__main__:main"
 
-[project.urls]
-Homepage   = "https://github.com/invariant-games/quill"
-Repository = "https://github.com/invariant-games/quill"
-
 [tool.setuptools.packages.find]
-where = ["."]
+where   = ["."]
+include = ["quill*"]
+exclude = ["scratch", "scratch.*", "tests", "tests.*", "build", "build.*", "rustext", "rustext.*", "companions", "companions.*"]
 
 [tool.setuptools.package-data]
-quill = ["py.typed"]
+# Ship the C/C++ sources so a source build (sdist, or the pure-Python wheel on a
+# box with a toolchain) can recompile the optional extensions via setup.py:
+#   *.c                 -> the numpy-backed list-conv / counting-sort exts
+#   _native_src/*.{cpp,hpp} -> the bundled CPU backends (quill._native)
+quill = ["py.typed", "*.c", "_native_src/*.cpp", "_native_src/*.hpp"]
+
+# The compiled CPU fast-sort backends (rust_voracious/rust_parallel_radix/ips4o/
+# numa/simd_companion) are now FOLDED IN as a single bundled extension,
+# ``quill._native`` (built from quill/_native_src/ — see setup.py). They ship
+# inside quill-sort's per-platform binary wheels (built by cibuildwheel below),
+# so ``pip install quill-sort`` gets the fast path with no extra installs. Where
+# no binary wheel matches, the sdist recompiles it (needs a C++ compiler), and
+# if that fails the pure-Python paths take over — install never fails. The old
+# standalone quill-fastsort* companions are still probed as a fallback for
+# existing installs. GPU (cupy) stays an opt-in ``[gpu]`` extra.
+
+# ── cibuildwheel: per-platform binary wheels carrying quill._native ──────────
+[tool.cibuildwheel]
+# cibuildwheel 4.x requires Python >= 3.9. cp38 (EOL Oct 2024) still installs via
+# the sdist / pure-Python wheel; it just gets no prebuilt binary wheel.
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip  = "*_i686 pp*"
+# QUILL_FORCE_C_EXT makes a failed native build FAIL the wheel (a missing backend
+# in a binary wheel is a bug); the sdist path stays graceful (optional=True).
+environment = { QUILL_FORCE_C_EXT = "1" }
+# Prove the shipped wheel actually carries the native backend before publishing.
+test-requires = "numpy"
+test-command = 'python -c "import quill, numpy as np; from quill import _native; a=np.random.randint(0,2**40,300000).astype(np.int64); assert (quill.sort_array(a.copy())==np.sort(a)).all(); assert \"rust_parallel_radix\" in quill.available_backends()"'
+
+[tool.cibuildwheel.macos]
+environment = { QUILL_FORCE_C_EXT = "1", MACOSX_DEPLOYMENT_TARGET = "11.0" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: marks tests as slow (parallel, large data)",
+]
+addopts = "-v --tb=short --timeout=120"
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true

@@ -1,0 +1,35 @@
+Metadata-Version: 2.4
+Name: quill-fastsort-parallel
+Version: 0.4.0
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Rust
+Classifier: Topic :: Scientific/Engineering
+Requires-Dist: numpy>=1.21
+Summary: Parallel MSD radix sort native extension for Quill (auto-detected by quill-sort)
+Keywords: sorting,sort,radix,parallel,rust,pyo3,quill
+Author: Isaiah Tucker
+License: MIT
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown; charset=UTF-8; variant=GFM
+
+# quill-fastsort-parallel
+
+Native Rust extension providing a parallel 256-way MSD radix sort for the
+[`quill-sort`](https://pypi.org/project/quill-sort/) library.
+
+Installs the Python module `quill._fastsort_parallel`, which `quill-sort`
+auto-detects at runtime and uses to break the Python ceiling on large numeric
+arrays (10M+ ints/floats) by leveraging all CPU cores and zero-copy numpy
+buffers.
+
+Supports `i64`, `u64`, `i32`, `u32`, `f64`, `f32`. Operates in place on the
+numpy buffer pointer and releases the GIL for the entire sort.
+
+Built with [PyO3](https://pyo3.rs), [rayon](https://crates.io/crates/rayon),
+and [voracious_radix_sort](https://crates.io/crates/voracious_radix_sort).
+Companion to `quill-fastsort` (the single-threaded leaf-only extension).
+

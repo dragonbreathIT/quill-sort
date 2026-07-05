@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: quill-fastsort-numa
+Version: 0.1.0
+Requires-Dist: numpy>=1.21
+Summary: NUMA-aware sort native extension for QuillSort
+License: MIT
+Requires-Python: >=3.8

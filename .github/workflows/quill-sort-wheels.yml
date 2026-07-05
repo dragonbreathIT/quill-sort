@@ -1,0 +1,85 @@
+name: quill-sort wheels
+
+# Builds quill-sort's release artifacts and publishes them on a GitHub Release:
+#   * per-platform BINARY wheels (cibuildwheel) that carry the bundled compiled
+#     backends (quill._native) — Linux x86_64/aarch64, macOS x86_64/arm64, Windows;
+#   * a pure-Python py3-none-any wheel (QUILL_NO_C_EXT=1) as the universal fallback
+#     for platforms with no binary wheel (installs instantly, no compiler);
+#   * the sdist (recompiles quill._native where a toolchain exists).
+# pip prefers: matching binary wheel > py3-none-any wheel > sdist.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — no token in CI. One-time:
+# PyPI project quill-sort -> Manage -> Publishing -> add GitHub publisher
+# (workflow: quill-sort-wheels.yml, environment: blank).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "quill/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".github/workflows/quill-sort-wheels.yml"
+
+concurrency:
+  group: quill-sort-wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binary_wheels:
+    name: wheels · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test binary wheels (native backend forced)
+        uses: pypa/cibuildwheel@v2.21.3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-binary-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  pure_and_sdist:
+    name: pure-python wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build py3-none-any wheel (no native) + sdist
+        run: |
+          python -m pip install --upgrade build
+          QUILL_NO_C_EXT=1 python -m build --outdir dist
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-pure-sdist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: [binary_wheels, pure_and_sdist]
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Sanity — one binary wheel per platform + a py3-none-any + an sdist
+        run: ls -l dist && ls dist | grep -q 'py3-none-any.whl' && ls dist | grep -q '.tar.gz'
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

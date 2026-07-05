@@ -1,0 +1,38 @@
+Metadata-Version: 2.4
+Name: quill-fastsort
+Version: 6.0.4
+Requires-Dist: numpy>=1.21
+Summary: Compiled multi-threaded radix sort backend (quill._fastsort) for quill-sort
+Author: Isaiah Tucker
+License: MIT
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown; charset=UTF-8; variant=GFM
+Project-URL: Homepage, https://github.com/invariant-games/quill
+Project-URL: Repository, https://github.com/invariant-games/quill
+
+# quill-fastsort
+
+Compiled multi-threaded radix-sort backend for
+[quill-sort](https://pypi.org/project/quill-sort/).
+
+This package delivers a single compiled extension module, `quill._fastsort`
+(a PyO3 binding over `voracious_radix_sort`), which `quill-sort` imports
+opportunistically. With it installed, `quill.sort_array()` dispatches int64 /
+float64 arrays to a multi-threaded radix sort measured at **~5× faster than
+`np.sort`** (int64) and **~3× faster** (float64) on a 28-core machine.
+
+```bash
+pip install quill-sort quill-fastsort
+```
+
+```python
+import quill, numpy as np
+quill.available_backends()          # -> ['rust_voracious', ...]
+quill.sort_array(np.random.randint(0, 2**31, 10_000_000, dtype=np.int64))
+```
+
+Installing it is purely a speed optimisation: `quill-sort` works correctly
+without it, falling back through its backend chain (GPU / polars / numpy) to
+`np.sort`. Prebuilt wheels are stable-ABI (`abi3`, one wheel per platform covers
+CPython ≥ 3.8). MIT licensed.
+

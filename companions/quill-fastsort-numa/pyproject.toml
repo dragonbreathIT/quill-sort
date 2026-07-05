@@ -1,0 +1,42 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "quill-fastsort-numa"
+version         = "0.2.0"
+description     = "NUMA-aware parallel MSD-radix sort backend (numa API) for quill-sort — portable C++ build for macOS, Linux and Windows."
+readme          = "README.md"
+license         = { text = "MIT" }
+authors         = [{ name = "Isaiah Tucker" }]
+requires-python = ">=3.8"
+dependencies    = ["numpy>=1.21"]
+keywords        = ["sorting", "radix sort", "parallel", "numa", "quill", "quill-sort"]
+classifiers = [
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+]
+
+[tool.setuptools]
+packages = ["quill_fastsort_numa"]
+
+# cibuildwheel: produces macOS (arm64+x86_64), Linux (x86_64+aarch64) and Windows
+# wheels in CI. The extension is header-only C++17, so no per-wheel system deps.
+[tool.cibuildwheel]
+build = "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
+# Skip 32-bit and PyPy. archs default to "auto": the CI matrix uses native runners
+# per arch (see .github/workflows/companion-wheels.yml), so each job builds only
+# its own architecture — no QEMU, no cross-build duplicates.
+skip  = "*_i686 pp*"
+# Smoke-test every built wheel on its native arch before it can be published.
+# numa_sort_* works on every platform; detect_topology() only reports >1 node on
+# multi-socket Linux, so the sort kernel is what we validate here.
+test-requires = "numpy"
+test-command = 'python -c "import numpy as np, quill_fastsort_numa as m; a=np.random.randint(-10**12,10**12,50000).astype(np.int64); b=a.copy(); m.numa_sort_i64(a); assert (a==np.sort(b)).all(); m.detect_topology()"'
+
+[tool.cibuildwheel.macos]
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0" }

@@ -1,0 +1,37 @@
+# ── secrets — NEVER commit ──────────────────────────────────────────────────
+into.env
+*.env
+*.pypirc
+
+# ── build artifacts ─────────────────────────────────────────────────────────
+build/
+dist/
+wheelhouse/
+*.egg-info/
+*.so
+*.pyd
+*.dylib
+*.o
+__pycache__/
+*.py[cod]
+
+# compiled native backend (built from quill/_native_src/ at install time)
+quill/_native.*.so
+quill/_counting_ext.*.so
+quill/_listconv_ext.*.so
+
+# ── companion build artifacts (source kept, binaries not) ───────────────────
+companions/**/dist/
+companions/**/build/
+companions/**/*.egg-info/
+companions/**/libhydra.so
+experiments/**/*.so
+experiments/**/radix_bench
+experiments/**/test_core
+experiments/**/bench_core
+
+# ── local tooling / scratch ─────────────────────────────────────────────────
+.venv/
+venv*/
+.pypi_downloads/
+.DS_Store

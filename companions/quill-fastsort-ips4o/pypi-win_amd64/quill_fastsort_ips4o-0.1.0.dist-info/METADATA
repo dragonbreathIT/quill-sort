@@ -1,0 +1,28 @@
+Metadata-Version: 2.2
+Name: quill-fastsort-ips4o
+Version: 0.1.0
+Summary: ips4o (DuckDB/Polars parallel samplesort) native extension for Quill
+Author: Isaiah Tucker
+License: MIT
+Requires-Python: >=3.8
+Requires-Dist: numpy>=1.21
+Description-Content-Type: text/markdown
+
+# quill-fastsort-ips4o
+
+Native C++ extension that exposes the [ips4o](https://github.com/ips4o/ips4o)
+in-place parallel super scalar samplesort (the same kernel used internally by
+DuckDB and Polars) as a Python module for the [QuillSort](https://pypi.org/project/quill-sort/)
+dispatcher. QuillSort's runtime auto-picker measures latency per `(dtype, size)`
+bucket and chooses between its Rust parallel-MSD-radix kernel and this ips4o
+samplesort kernel; C++ assists Rust, it does not replace it. The module installs
+as the top-level Python name `quill_fastsort_ips4o` and exposes in-place sort
+entry points (`sort_i64`, `sort_u64`, `sort_i32`, `sort_u32`, `sort_f64`,
+`sort_f32`) that operate on contiguous numpy ndarrays and release the GIL for
+the duration of the sort.
+
+## Install
+
+```
+pip install quill-fastsort-ips4o
+```

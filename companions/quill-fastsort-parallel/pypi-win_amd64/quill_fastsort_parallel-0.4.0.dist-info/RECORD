@@ -1,0 +1,6 @@
+quill_fastsort_parallel/__init__.py,sha256=j8trmZs9xb07lftfM09EroNzYzcyb6CEvCxeKM9xLoM,175
+quill_fastsort_parallel/quill_fastsort_parallel.pyd,sha256=LQC7QgvvJAdpVzHxkLPr4PO8qaxNk-i0p850OTaV7lc,600064
+quill_fastsort_parallel-0.4.0.dist-info/METADATA,sha256=ZrpELGAe-f5YeR1Zaj_azOiU-fB4zfa28iO174GvPuo,1452
+quill_fastsort_parallel-0.4.0.dist-info/WHEEL,sha256=RD58zsFMg5Xm6opfRt5qGok5PcA30CAhknyKFSihcu8,95
+quill_fastsort_parallel-0.4.0.dist-info/sboms/quill-fastsort-parallel.cyclonedx.json,sha256=1dtSZ3xINl7nXyb9HMybnRKqMk79NQZ7hhDx9L6qlSo,44692
+quill_fastsort_parallel-0.4.0.dist-info/RECORD,,

@@ -1,47 +1,38 @@
 """
 quill/_parallel.py
 ------------------
-Parallel sort engine — shared-memory MSD radix sort.
+Parallel sort engine.
 
-ARCHITECTURE
-────────────
-For integer data (the common case), Quill uses a parallel MSD radix sort
-implemented entirely via shared memory + numpy.  No pickling of large arrays.
+The honest physics (measured across machines): numpy's single-threaded sort is
+an AVX introsort that runs near memory bandwidth, so a general parallel sort can
+only *modestly* beat it, and only on large arrays with enough cores. So the
+contract here is **never lose**:
 
-  Phase 1 — PARALLEL LOCAL HISTOGRAMS
-    P workers each count their stripe of the input independently.
-    All writes hit private stack arrays → zero false sharing.
+  * ``should_parallelize`` gates engagement on n AND core count (from per-machine
+    config). Below the threshold we don't even build threads.
+  * The kernel uses ``np.partition`` (introselect) to split the array into P
+    contiguous value-ordered blocks with a single C call (no gather), then sorts
+    the blocks concurrently in a ThreadPool (numpy releases the GIL). No merge.
+  * If anything is marginal, the caller still has plain np.sort to fall back to.
 
-  Phase 2 — PREFIX SUM
-    O(256 × P) scan in the main process. Determines each worker's write
-    offset into each output bucket.
+Threads (not processes) are used on purpose: numpy releases the GIL inside
+``ndarray.sort``, so threads give true parallelism with zero pickling/spawn tax —
+which also means identical behaviour on Windows (spawn) and Linux (fork).
 
-  Phase 3 — PARALLEL SCATTER
-    Each worker writes its elements to the correct bucket position using
-    argsort + split (vectorised, no Python loop over 256 buckets).
-
-  Phase 4 — PARALLEL BUCKET SORT
-    Each bucket is sorted independently. Small buckets → ThreadPoolExecutor
-    (numpy releases GIL). Large buckets → ProcessPoolExecutor.
-
-For non-integer/non-numpy data, falls back to pool.map with keyed sort
-and k-way heap merge.
-
-PERFORMANCE vs OLD APPROACH
-    Old: pool.map over P chunks → sort each → heap merge
-         Bottleneck: heap merge is O(n log P), heap pops in Python
-    New: parallel histogram → prefix sum → parallel scatter → parallel sort
-         All hot loops stay in C/numpy. Merge = O(1) (buckets in order).
+Worker count is now adaptive per ``cpu_count`` (see
+:func:`_adaptive_partition_workers`); the legacy hardcoded cap can still be
+overridden via the ``parallel_partition_workers`` (or legacy
+``numpy_partition_workers``) key in :mod:`quill._config`.
 """
 
 from __future__ import annotations
 
-import math
+import atexit
 import heapq
-import multiprocessing as mp
+import math
 import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from multiprocessing.shared_memory import SharedMemory
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 try:
@@ -50,396 +41,213 @@ try:
 except ImportError:
     _NUMPY = False
 
+from ._config import load_config
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
+# PERSISTENT THREAD POOL (cheap to create, but reuse avoids churn).
 # ─────────────────────────────────────────────────────────────────────────────
 
-RADIX_BITS    = 8
-RADIX_BUCKETS = 1 << RADIX_BITS   # 256
-
-# Below this size per bucket, use threads instead of processes
-THREAD_SORT_THRESHOLD = 500_000
-
-# Heavy-key fast path: detect via sample, then bypass worker partition/sort.
-HEAVY_KEY_SAMPLE_SIZE  = 1_000
-HEAVY_KEY_SAMPLE_RATIO = 0.20
+_POOL: Optional[ThreadPoolExecutor] = None
+_POOL_SIZE = 0
+_POOL_LOCK = threading.Lock()
 
 
-def _detect_heavy_keys(values_i64: np.ndarray) -> np.ndarray:
-    """
-    Scout phase: sample up to 1,000 random values and flag any key whose
-    sample frequency exceeds 20%.
-    """
-    n = int(values_i64.size)
-    if n == 0:
-        return np.empty(0, dtype=np.int64)
-
-    sample_n = min(HEAVY_KEY_SAMPLE_SIZE, n)
-    if sample_n == n:
-        sample = values_i64
-    else:
-        rng = np.random.default_rng()
-        idx = rng.choice(n, size=sample_n, replace=False)
-        sample = values_i64[idx]
-
-    uniq, counts = np.unique(sample, return_counts=True)
-    heavy = uniq[counts > (sample_n * HEAVY_KEY_SAMPLE_RATIO)]
-    return heavy.astype(np.int64, copy=False)
+def _get_pool(n_workers: int) -> ThreadPoolExecutor:
+    global _POOL, _POOL_SIZE
+    with _POOL_LOCK:
+        if _POOL is None or _POOL_SIZE < n_workers:
+            if _POOL is not None:
+                _POOL.shutdown(wait=False)
+            _POOL = ThreadPoolExecutor(max_workers=n_workers)
+            _POOL_SIZE = n_workers
+        return _POOL
 
 
-def _reinsert_heavy_keys(
-    sorted_light_i64: np.ndarray,
-    heavy_counts: dict[int, int],
-    total_n: int,
-) -> np.ndarray:
-    """
-    Merge pre-counted heavy keys back into the fully sorted non-heavy stream.
-    """
-    if not heavy_counts:
-        return sorted_light_i64
+def _shutdown_pool() -> None:
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is not None:
+            _POOL.shutdown(wait=False)
+            _POOL = None
 
-    merged = np.empty(total_n, dtype=np.int64)
-    src = 0
-    dst = 0
 
-    for key, count in sorted(heavy_counts.items()):
-        insert_at = int(np.searchsorted(sorted_light_i64, key, side='left'))
-        run = insert_at - src
-        if run > 0:
-            merged[dst:dst + run] = sorted_light_i64[src:insert_at]
-            dst += run
-            src = insert_at
-        merged[dst:dst + count] = key
-        dst += count
+atexit.register(_shutdown_pool)
 
-    if src < len(sorted_light_i64):
-        merged[dst:] = sorted_light_i64[src:]
 
-    return merged
+def worker_count(ncores: Optional[int] = None) -> int:
+    cfg = load_config()
+    if ncores is None:
+        ncores = os.cpu_count() or 1
+    cap = cfg.get("parallel_max_workers", 0) or ncores
+    return max(1, min(ncores, cap))
+
+
+def should_parallelize(n: int, dtype_kind: str = "i") -> bool:
+    """Adaptive, per-machine gate. Returns True only when parallelism is
+    expected to *win* on this box for this dataset size."""
+    if not _NUMPY:
+        return False
+    cfg = load_config()
+    ncores = os.cpu_count() or 1
+    if ncores < cfg.get("parallel_min_cores", 4):
+        return False
+    if n < cfg.get("parallel_min_n", 3_000_000):
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODULE-LEVEL WORKER FUNCTIONS (must be picklable on Windows/spawn)
+# ARRAY KERNEL — parallel partition sort. Operates on an ndarray in place.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _worker_count_histogram(args):
+# Memory-bandwidth wall: the parallel np.partition sort saturates at a SMALL
+# worker count (measured 1.5-1.9x at P=2-3 int64; using all cores was a 0.72x
+# *regression*). Cap workers so this path never loses to np.sort.
+_PARTITION_WORKERS = 3
+
+
+def _adaptive_partition_workers(n: int, dtype_kind: str) -> int:
+    """Return optimal worker count for parallel partition sort.
+
+    Memory bandwidth wall: real measurements on DDR4/DDR5 show diminishing
+    returns past ~3 workers per memory channel. For NUMA Xeon/EPYC boxes
+    users can override via config (parallel_partition_workers).
     """
-    Count local histogram for a stripe of shared input array.
-    Returns histogram as bytes (int64 × 256).
+    cfg = load_config()
+    override = cfg.get('parallel_partition_workers', 0) or cfg.get('numpy_partition_workers', 0)
+    if override > 0:
+        return override
+    ncores = os.cpu_count() or 1
+    # Heuristic: 1 worker per ~8 cores beyond 4, capped at 8
+    if ncores <= 4:
+        return min(2, ncores)
+    if ncores <= 12:
+        return 3
+    if ncores <= 24:
+        return 4
+    if ncores <= 48:
+        return 6
+    return 8
+
+
+def parallel_sort_array(arr: "np.ndarray", stable: bool = True,
+                        ncores: Optional[int] = None) -> "np.ndarray":
     """
-    shm_name, dtype_str, start, end, global_min, bit_shift = args
-    shm   = SharedMemory(name=shm_name)
-    dtype = np.dtype(dtype_str)
-    arr   = np.ndarray((end - start,), dtype=dtype, buffer=shm.buf,
-                       offset=start * dtype.itemsize)
-
-    shifted = ((arr.astype(np.int64) - global_min) >> bit_shift)
-    np.clip(shifted, 0, RADIX_BUCKETS - 1, out=shifted)
-    hist    = np.bincount(shifted.astype(np.intp), minlength=RADIX_BUCKETS)
-    shm.close()
-    return hist.astype(np.int64).tobytes()
-
-
-def _worker_scatter(args):
+    Sort *arr* ascending in place using a parallel partition sort.
+    Returns *arr*. Falls back to a plain sort when the array is too small to
+    benefit (so this is always safe to call).
     """
-    Scatter elements from input stripe to output positions.
-    Uses vectorised argsort+split to avoid per-element Python work.
-    """
-    shm_in_name, shm_out_name, dtype_str, start, end, \
-        global_min, bit_shift, worker_offsets_bytes = args
+    import time as _time
+    n = arr.size
+    # Adaptive worker count: respects config override but otherwise scales by
+    # cpu_count rather than the old hardcoded 3-cap, so NUMA boxes can use
+    # more threads where the memory subsystem can actually feed them.
+    P = max(2, min(worker_count(ncores),
+                   _adaptive_partition_workers(n, arr.dtype.kind)))
+    # Bounded integers: counting sort beats any comparison sort, parallel or
+    # not — take it before spending threads.
+    if arr.dtype.kind in "iu" and n > 1 and arr.dtype.itemsize >= 8:
+        from ._strategies import _counting_is_worth_it, counting_sort_array
+        mn = int(arr.min()); mx = int(arr.max())
+        if mx > mn and _counting_is_worth_it(n, mx - mn):
+            return counting_sort_array(arr, mn, mx)
+    # Value-only sort: fastest kernel == stable result (see sort_array).
+    if P < 2 or n < 2 * P:
+        arr.sort()
+        return arr
 
-    shm_in  = SharedMemory(name=shm_in_name)
-    shm_out = SharedMemory(name=shm_out_name)
-    dtype   = np.dtype(dtype_str)
+    # Split into P contiguous value-ordered blocks with one introselect pass.
+    _t0 = _time.perf_counter()
+    kths = [(i * n) // P for i in range(1, P)]
+    arr.partition(kths)
+    bounds = [0] + kths + [n]
+    slices = [(bounds[i], bounds[i + 1]) for i in range(P)
+              if bounds[i + 1] > bounds[i]]
 
-    inp  = np.ndarray((end - start,), dtype=dtype, buffer=shm_in.buf,
-                      offset=start * dtype.itemsize)
-    out  = np.ndarray((shm_out.size // dtype.itemsize,), dtype=dtype,
-                      buffer=shm_out.buf)
-
-    offsets = np.frombuffer(worker_offsets_bytes, dtype=np.int64).copy()
-    keys    = ((inp.astype(np.int64) - global_min) >> bit_shift)
-    np.clip(keys, 0, RADIX_BUCKETS - 1, out=keys)
-
-    # Vectorised scatter: sort by bucket key, then copy each contiguous run
-    order        = np.argsort(keys.astype(np.intp), kind='stable')
-    sorted_elems = inp[order]
-    sorted_keys  = keys[order]
-
-    boundaries = np.flatnonzero(np.diff(sorted_keys)) + 1
-    splits     = np.split(sorted_elems, boundaries)
-    bucket_ids = sorted_keys[np.concatenate([[0], boundaries])]
-
-    for chunk, b in zip(splits, bucket_ids.tolist()):
-        b   = int(b)
-        dst = int(offsets[b])
-        cnt = len(chunk)
-        out[dst:dst + cnt] = chunk
-        offsets[b] += cnt
-
-    shm_in.close()
-    shm_out.close()
-
-
-def _worker_sort_shm_slice(args):
-    """Sort a slice of shared memory in-place (large bucket).
-    Uses optimal sort kind per dtype — benchmark-proven:
-    uint8/uint16 → stable (radix), int32/int64 → default (quicksort)."""
-    shm_name, dtype_str, start, end = args
-    shm   = SharedMemory(name=shm_name)
-    dtype = np.dtype(dtype_str)
-    view  = np.ndarray((end - start,), dtype=dtype, buffer=shm.buf,
-                       offset=start * dtype.itemsize)
-    # uint8/uint16: stable is 10-17x faster (1-2 pass radix)
-    # int32/int64: default quicksort is 20x faster than stable (4+ pass radix)
-    if dtype.kind == 'u' and dtype.itemsize <= 2:
-        view.sort(kind='stable')
-    else:
-        view.sort()  # default = quicksort/introsort
-    shm.close()
-
-
-def _worker_keyed_sort(args):
-    chunk, keys = args
-    return [x for _, __, x in sorted(zip(keys, range(len(chunk)), chunk))]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# K-WAY HEAP MERGE (generic fallback)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _kway_merge(chunks: list, key_fn) -> list:
-    heap  = []
-    iters = [iter(c) for c in chunks]
-    for i, it in enumerate(iters):
-        v = next(it, None)
-        if v is not None:
-            heapq.heappush(heap, (key_fn(v), i, v, it))
-    result = []
-    while heap:
-        k, i, v, it = heapq.heappop(heap)
-        result.append(v)
-        nxt = next(it, None)
-        if nxt is not None:
-            heapq.heappush(heap, (key_fn(nxt), i, nxt, it))
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC INTERFACE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parallel_sort(
-    data: list, key_fn, profile: dict, identity_key: bool = False
-) -> None:
-    """Sort `data` in-place using all available CPU cores."""
-    ncores = mp.cpu_count() or 4
-
-    is_int = profile.get("dtype", "") in ("int_pos", "int_neg", "int_mixed")
-
-    if is_int and _NUMPY and identity_key:
-        _parallel_msd_radix(data, profile, ncores)
-        return
-
-    _parallel_generic(data, key_fn, ncores)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PARALLEL MSD RADIX SORT (integer, shared memory)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parallel_msd_radix(data: list, profile: dict, ncores: int) -> None:
-    """
-    Parallel MSD radix sort via shared memory.
-
-    Steps:
-      1. Convert list → narrowest-dtype numpy array → shared memory
-      2. P workers each count their stripe → local histograms
-      3. Prefix sum → per-worker write offsets
-      4. P workers scatter elements to output shared memory
-      5. Sort each bucket in parallel (threads for small, processes for large)
-      6. Write result back to data list
-    """
-    n_total = len(data)
-    arr_i64 = np.array(data, dtype=np.int64)
-
-    # Scout phase: detect heavy keys from a tiny random sample.
-    sampled_heavy = _detect_heavy_keys(arr_i64)
-    heavy_counts: dict[int, int] = {}
-    light_i64 = arr_i64
-    if sampled_heavy.size:
-        heavy_mask = np.isin(arr_i64, sampled_heavy)
-        if heavy_mask.any():
-            heavy_vals = arr_i64[heavy_mask]
-            uniq, counts = np.unique(heavy_vals, return_counts=True)
-            heavy_counts = {
-                int(k): int(c)
-                for k, c in zip(uniq.tolist(), counts.tolist())
-                if c > 0
-            }
-            light_i64 = arr_i64[~heavy_mask]
-
-    n = int(light_i64.size)
-    if n == 0:
-        # All elements were heavy keys; no worker pass needed.
-        result = _reinsert_heavy_keys(np.empty(0, dtype=np.int64), heavy_counts, n_total)
-        data[:] = result.tolist()
-        return
-
-    mn = int(light_i64.min())
-    mx = int(light_i64.max())
-
-    # Select narrowest dtype for non-heavy values only.
-    rng = mx - mn
-    if mn >= 0:
-        if rng < 256:        dtype = np.uint8;  shift = 0
-        elif rng < 65_536:   dtype = np.uint16; shift = 0
-        elif rng < 2**31:    dtype = np.int32;  shift = 0
-        else:                dtype = np.int64;  shift = 0
-    else:
-        shift = -mn
-        rng   = mx + shift
-        if rng < 256:        dtype = np.uint8
-        elif rng < 65_536:   dtype = np.uint16
-        elif rng < 2**31:    dtype = np.int32
-        else:                dtype = np.int64; shift = 0
-
-    dtype = np.dtype(dtype)
-    dtype_str = dtype.str
-    global_min = mn
-    val_range  = mx - mn + 1
-    bit_len    = max(1, val_range.bit_length())
-    bit_shift  = max(0, bit_len - RADIX_BITS)
-
-    # Build compact worker input (heavy keys excluded).
-    if shift:
-        arr = (light_i64 + shift).astype(dtype)
-    else:
-        arr = light_i64.astype(dtype)
-
-    shm_in = SharedMemory(create=True, size=arr.nbytes)
-    try:
-        inp_shm = np.ndarray(arr.shape, dtype=dtype, buffer=shm_in.buf)
-        inp_shm[:] = arr
-        del arr
-
-        # Phase A: parallel local histograms
-        stripe     = math.ceil(n / ncores)
-        boundaries = [(i * stripe, min((i + 1) * stripe, n))
-                      for i in range(ncores) if i * stripe < n]
-        n_workers  = len(boundaries)
-
-        count_args = [
-            (shm_in.name, dtype_str, s, e, global_min if shift == 0 else 0, bit_shift)
-            for s, e in boundaries
-        ]
-
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            hist_bytes = list(pool.map(_worker_count_histogram, count_args))
-
-        local_hists = np.array(
-            [np.frombuffer(h, dtype=np.int64) for h in hist_bytes]
-        )  # (n_workers, RADIX_BUCKETS)
-
-        global_hist  = local_hists.sum(axis=0)
-        bucket_start = np.zeros(RADIX_BUCKETS + 1, dtype=np.int64)
-        bucket_start[1:] = np.cumsum(global_hist)
-
-        # Per-worker write offsets: worker w starts at bucket_start[b] +
-        # sum of local_hists[0..w-1, b]
-        cum_local      = np.vstack([[0] * RADIX_BUCKETS, local_hists[:-1]])
-        worker_offsets = bucket_start[:RADIX_BUCKETS] + np.cumsum(cum_local, axis=0)
-
-        # Phase B: parallel scatter to output shared memory
-        shm_out = SharedMemory(create=True, size=inp_shm.nbytes)
-        try:
-            scatter_args = [
-                (shm_in.name, shm_out.name, dtype_str,
-                 boundaries[i][0], boundaries[i][1],
-                 global_min if shift == 0 else 0, bit_shift,
-                 worker_offsets[i].tobytes())
-                for i in range(n_workers)
-            ]
-            with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                list(pool.map(_worker_scatter, scatter_args))
-
-            out_arr = np.ndarray(inp_shm.shape, dtype=dtype,
-                                 buffer=shm_out.buf).copy()
-
-        finally:
-            shm_out.close()
-            shm_out.unlink()
-
-    finally:
-        shm_in.close()
-        shm_in.unlink()
-
-    # Phase C: sort each bucket in parallel
-    bucket_slices = [
-        (int(bucket_start[b]), int(bucket_start[b + 1]))
-        for b in range(RADIX_BUCKETS)
-        if bucket_start[b + 1] > bucket_start[b]
-    ]
-
-    large = [(s, e) for s, e in bucket_slices if (e - s) >= THREAD_SORT_THRESHOLD]
-    small = [(s, e) for s, e in bucket_slices if (e - s) <  THREAD_SORT_THRESHOLD]
-
-    # Small buckets: sort in threads (numpy releases GIL).
-    # Use optimal kind per dtype.
-    _use_stable = (dtype.kind == 'u' and dtype.itemsize <= 2)
-
-    def _sort_small(se):
+    def _sort_block(se):
         s, e = se
-        if _use_stable:
-            out_arr[s:e].sort(kind='stable')
-        else:
-            out_arr[s:e].sort()  # default = quicksort
+        arr[s:e].sort()
 
-    with ThreadPoolExecutor(max_workers=ncores) as pool:
-        list(pool.map(_sort_small, small))
-
-    # Large buckets: sort in processes via shared memory
-    if large:
-        shm_sort = SharedMemory(create=True, size=out_arr.nbytes)
-        try:
-            sort_shm = np.ndarray(out_arr.shape, dtype=dtype, buffer=shm_sort.buf)
-            sort_shm[:] = out_arr
-
-            large_args = [(shm_sort.name, dtype_str, s, e) for s, e in large]
-            with ProcessPoolExecutor(max_workers=min(ncores, len(large))) as pool:
-                list(pool.map(_worker_sort_shm_slice, large_args))
-
-            out_arr[:] = sort_shm
-
-        finally:
-            shm_sort.close()
-            shm_sort.unlink()
-
-    # Write back to data list — convert dtype back, then reinsert heavy keys.
-    if shift:
-        sorted_light = out_arr.astype(np.int64) - shift
-    else:
-        sorted_light = out_arr.astype(np.int64)
-
-    result = _reinsert_heavy_keys(sorted_light, heavy_counts, n_total)
-    data[:] = result.tolist()
+    pool = _get_pool(P)
+    list(pool.map(_sort_block, slices))
+    # Tuning telemetry: let the per-machine dispatcher learn whether the
+    # parallel-partition path actually wins on this box. Errors swallowed —
+    # never let measurement break a sort.
+    try:
+        from ._tuning import DB as _TUNING_DB
+        _TUNING_DB.record('parallel_partition', arr.dtype.kind, n,
+                          _time.perf_counter() - _t0)
+    except BaseException:  # noqa: BLE001
+        pass
+    return arr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GENERIC PARALLEL SORT (non-integer or no numpy)
+# LIST ENTRY POINT — used by the core for the parallel=True / auto path.
 # ─────────────────────────────────────────────────────────────────────────────
+
+def parallel_sort(data: list, key_fn, profile: dict,
+                  identity_key: bool = False, stable: bool = True,
+                  reverse: bool = False) -> None:
+    """Sort *data* (a Python list) in place using all useful cores.
+    Numeric identity-key data goes through the array kernel; everything else
+    uses a chunked generic merge.
+
+    When *reverse* is True the result is the ascending sort reversed via
+    ``list.reverse()``. Note: this flips the relative order of equal-key
+    elements, so a reverse=True parallel sort is **not stable** for ties —
+    callers that need stable descending ordering should sort with a negated
+    key on the ascending path instead. NaNs (floats) always sort to the end
+    of the ascending result, which means they land at the *start* under
+    reverse=True (matching the v6 contract in :mod:`quill._strategies`).
+    """
+    dtype = profile.get("dtype", "")
+    numeric = dtype in ("int_pos", "int_neg", "int_mixed", "float")
+
+    if _NUMPY and identity_key and numeric:
+        arr = np.asarray(data)
+        if arr.dtype.kind in "iuf":
+            # NaN handling for floats: strip, sort, reappend.
+            if arr.dtype.kind == "f":
+                nan_mask = np.isnan(arr)
+                nan_count = int(nan_mask.sum())
+                if nan_count:
+                    arr = arr[~nan_mask]
+            else:
+                nan_count = 0
+            arr = parallel_sort_array(arr, stable=stable)  # may return new array
+            out = arr.tolist()
+            if reverse:
+                out.reverse()
+                # NaN-to-end contract under reverse=True means NaNs at start.
+                if nan_count:
+                    out = [float("nan")] * nan_count + out
+            else:
+                if nan_count:
+                    out.extend([float("nan")] * nan_count)
+            data[:] = out
+            return
+
+    _parallel_generic(data, key_fn, worker_count())
+    if reverse:
+        data.reverse()
+
 
 def _parallel_generic(data: list, key_fn: Callable, ncores: int) -> None:
-    n       = len(data)
-    chunk_n = max(10_000, math.ceil(n / ncores))
-    chunks  = [data[i:i + chunk_n] for i in range(0, n, chunk_n)]
-    nw      = min(ncores, len(chunks))
+    """Chunk → sort each chunk in a thread → k-way merge. Numpy-free safe path.
+    (Pure-Python comparison work is GIL-bound, so this mainly helps when the
+    key function releases the GIL or for moderate sizes; it is always correct.)"""
+    n = len(data)
+    chunk_n = max(50_000, math.ceil(n / ncores))
+    chunks = [data[i:i + chunk_n] for i in range(0, n, chunk_n)]
+    if len(chunks) <= 1:
+        data.sort(key=key_fn if key_fn else None)
+        return
 
-    key_chunks = [[key_fn(x) for x in c] for c in chunks]
-    args       = list(zip(chunks, key_chunks))
+    def _sort_chunk(c):
+        c.sort(key=key_fn if key_fn else None)
+        return c
 
-    with mp.Pool(nw) as pool:
-        sorted_chunks = pool.map(_worker_keyed_sort, args)
-
-    data[:] = _kway_merge(sorted_chunks, key_fn)
+    pool = _get_pool(min(ncores, len(chunks)))
+    sorted_chunks = list(pool.map(_sort_chunk, chunks))
+    data[:] = list(heapq.merge(*sorted_chunks, key=key_fn if key_fn else None))

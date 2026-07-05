@@ -132,8 +132,19 @@ SAMPLE_SIZE       = 8_192
 # OBSERVER / RAM SENSING
 # ─────────────────────────────────────────────────────────────────────────────
 
+# If the OS reports less available RAM than this, the reading is almost
+# certainly a transient glitch rather than the machine literally being full.
+_RAM_FLOOR_BYTES = 512 * 1024 * 1024   # 512 MB
+
+
 def get_available_ram() -> int:
-    if _PSUTIL: return psutil.virtual_memory().available
+    if _PSUTIL:
+        raw = psutil.virtual_memory().available
+        if raw > 0:
+            return raw
+        # Bogus / transient zero — fall back to ¼ of total
+        total = psutil.virtual_memory().total
+        return max(_RAM_FLOOR_BYTES, total // 4)
     return 2 * 1024 ** 3
 
 def get_total_ram() -> int:
@@ -155,17 +166,41 @@ def estimate_dataset_bytes(data: list) -> int:
         return int(n * (50 + avg))
     return n * 64
 
-def should_use_external(data: list, force: bool = False) -> tuple:
+def should_use_external(data: list, force: bool = False,
+                        high_performance_mode: bool = False) -> tuple:
+    # The v5 external (disk) sort engine has audited correctness bugs: it can
+    # truncate float / mixed int-float data to integers and return non-monotonic
+    # results — and it raises nothing, so _core's in-memory never-lose try/except
+    # cannot catch it (silent wrong data would escape via the public
+    # high_performance_mode=True path). It is therefore QUARANTINED: disabled
+    # unless explicitly re-enabled with QUILL_ENABLE_EXTERNAL=1. Gated before the
+    # `force` branch so no caller can reach the broken engine; every dataset
+    # routes back to _core's safe in-memory sort.
+    if os.environ.get("QUILL_ENABLE_EXTERNAL") != "1":
+        return False, "external sort disabled (v5 engine quarantined)", 0
     if force:
         available  = get_available_ram()
         page_bytes = int(available * 0.20)
         page_elts  = max(MIN_PAGE_ELTS, page_bytes // 8)
         return True, "forced by caller", page_elts
 
-    available  = get_available_ram()
-    estimated  = estimate_dataset_bytes(data)
-    soft_limit = int(available * SOFT_LIMIT_RATIO)
-    hard_limit = int(available * HARD_LIMIT_RATIO)
+    available = get_available_ram()
+    estimated = estimate_dataset_bytes(data)
+
+    if high_performance_mode:
+        # Smart safety: compare against currently available RAM.
+        # Protects against swapping / OOM when the machine is already loaded.
+        ref_bytes  = available
+        ref_label  = f"{available/1e9:.1f}GB available RAM"
+    else:
+        # Conservative default: compare against total installed RAM.
+        # Transient low-RAM readings (e.g. after a prior large sort thrashed
+        # memory) won't spuriously send a 100 MB dataset to external sort.
+        ref_bytes  = get_total_ram()
+        ref_label  = f"{ref_bytes/1e9:.1f}GB total RAM"
+
+    soft_limit = int(ref_bytes * SOFT_LIMIT_RATIO)
+    hard_limit = int(ref_bytes * HARD_LIMIT_RATIO)
 
     if estimated < soft_limit:
         return False, "fits in RAM", 0
@@ -177,13 +212,13 @@ def should_use_external(data: list, force: bool = False) -> tuple:
         reason = (
             f"dataset ~{estimated/1e9:.1f}GB exceeds hard limit "
             f"({hard_limit/1e9:.1f}GB = {HARD_LIMIT_RATIO*100:.0f}% of "
-            f"{available/1e9:.1f}GB available RAM)"
+            f"{ref_label})"
         )
     else:
         reason = (
             f"dataset ~{estimated/1e6:.0f}MB exceeds soft limit "
             f"({soft_limit/1e6:.0f}MB = {SOFT_LIMIT_RATIO*100:.0f}% of "
-            f"{available/1e6:.0f}MB available RAM)"
+            f"{ref_label})"
         )
     return True, reason, page_elts
 
@@ -404,6 +439,31 @@ def _sort_bucket_worker(args):
     else:
         sorted_arr = _np.sort(arr)  # default = quicksort
     write_qwrite(dst, sorted_arr, is_sorted=True)
+    return src
+
+
+def _sort_and_write_bucket_worker(args):
+    """Sort a bucket file and write the result directly into a pre-allocated
+    output file at a specific byte offset.  Eliminates the intermediate sorted
+    bucket files — bucket source is deleted after write.
+    Returns the source path (for error reporting).
+    Safe to call from a thread (np.sort releases the GIL)."""
+    src, out_path, out_offset, np_dtype_str = args
+
+    arr = read_qwrite_full(src)
+    if arr.dtype.kind == 'u' and arr.dtype.itemsize <= 2:
+        sorted_arr = np.sort(arr, kind='stable')
+    else:
+        sorted_arr = np.sort(arr)
+
+    with open(out_path, 'r+b', buffering=0) as f:
+        f.seek(out_offset)
+        f.write(sorted_arr.tobytes())
+
+    try:
+        os.unlink(src)
+    except OSError:
+        pass
     return src
 
 
@@ -684,24 +744,44 @@ def radix_partition_sort(
     if not silent:
         print(f"  [Quill] Partition done in {t_part:.2f}s  "
               f"({non_empty} non-empty buckets)")
-        print(f"  [Quill] Sorting {non_empty} buckets in parallel "
+        print(f"  [Quill] Sorting {non_empty} buckets + writing pre-allocated output "
               f"({os.cpu_count()} workers)...")
 
-    # Sort each bucket in parallel
-    t_sort       = time.perf_counter()
-    sorted_paths = [p.replace('.qwrite', '_sorted.qwrite') for p in active_paths]
-    n_workers    = min(os.cpu_count() or 4, non_empty)
+    # Pre-allocate the final sorted output file and compute per-bucket offsets.
+    # Sort each bucket in parallel and write directly at its offset — no
+    # intermediate sorted-bucket files, no separate concat pass.
+    dtype_obj   = np.dtype(np_dtype)
+    total_elts  = sum(bucket_counts)
+    out_path    = os.path.join(tmp_dir, 'sorted_output.qwrite')
+    total_bytes = QWRITE_HEADER_SZ + total_elts * dtype_obj.itemsize
 
-    pairs = list(zip(active_paths, sorted_paths))
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        for old_path in pool.map(_sort_bucket_worker, pairs, chunksize=4):
-            try: os.unlink(old_path)
-            except OSError: pass
+    with open(out_path, 'wb') as f:
+        f.write(_make_header(dtype_obj.str, total_elts, True))
+        f.seek(total_bytes - 1)
+        f.write(b'\x00')
+
+    out_offsets = {}
+    off = QWRITE_HEADER_SZ
+    for b in range(RADIX_BUCKETS):
+        if bucket_counts[b] > 0:
+            out_offsets[b] = off
+            off += bucket_counts[b] * dtype_obj.itemsize
+
+    sort_write_args = [
+        (bucket_paths[b], out_path, out_offsets[b], dtype_obj.str)
+        for b in range(RADIX_BUCKETS)
+        if bucket_counts[b] > 0
+    ]
+
+    t_sort    = time.perf_counter()
+    n_workers = min(os.cpu_count() or 4, non_empty)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(_sort_and_write_bucket_worker, sort_write_args))
 
     if not silent:
-        print(f"  [Quill] Bucket sorts done in {time.perf_counter()-t_sort:.2f}s")
+        print(f"  [Quill] Bucket sort+write done in {time.perf_counter()-t_sort:.2f}s")
 
-    return sorted_paths
+    return [out_path]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1025,23 +1105,10 @@ def request_authorization(reason, page_size, n, high_performance_mode, silent):
             print(f"  [Quill] {reason}")
             print(f"  [Quill] Pages: {n_pages}  |  Page size: {page_size:,} elements\n")
         return True
-    print(f"\n  ┌─────────────────────────────────────────────────────────┐")
-    print(f"  │                  QUILL — EXTERNAL SORT                  │")
-    print(f"  └─────────────────────────────────────────────────────────┘")
-    print(f"  Reason    : {reason}")
-    print(f"  Strategy  : Split into {n_pages} pages of {page_size:,} elements each")
-    print(f"  Temp files: {n_pages} × .qwrite files in system temp dir")
-    print(f"  Cleanup   : Automatic (even on crash)")
-    print()
-    try:
-        answer = input("  Authorize Quill external sort? (y/n): ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  [Quill] Authorization cancelled.")
-        return False
-    if answer in ('y', 'yes'):
-        print(); return True
-    print("  [Quill] External sort declined. Attempting in-memory sort.")
-    return False
+    print(f"\n  [Quill] External sort triggered: {reason}")
+    print(f"  [Quill] Strategy: {n_pages} pages × {page_size:,} elements  "
+          f"(temp files auto-cleaned)\n")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1096,7 +1163,9 @@ def external_sort(
 ) -> bool:
 
     n = len(data)
-    needed, reason, page_size = should_use_external(data)
+    needed, reason, page_size = should_use_external(
+        data, high_performance_mode=high_performance_mode
+    )
     if not needed:
         return False
 
@@ -1144,24 +1213,16 @@ def external_sort(
             if bucket_paths is None:
                 use_radix_part = False
             else:
-                tmp_files.extend(bucket_paths)
+                # radix_partition_sort now returns a single pre-sorted output
+                # file (sort+write happened in parallel inside it) — no concat.
+                out_path = bucket_paths[0]
+                tmp_files.append(out_path)
                 t_p1 = time.perf_counter() - t_phase1
                 if not silent:
-                    print(f"  [Quill] Phase 1 complete in {t_p1:.3f}s  "
-                          f"({len(bucket_paths)} buckets)")
+                    print(f"  [Quill] Partition+sort complete in {t_p1:.3f}s")
 
-                t_phase2    = time.perf_counter()
-                merged_path = os.path.join(tmp_dir, 'merged_output.qwrite')
-                tmp_files.append(merged_path)
-
-                if not silent:
-                    print(f"  [Quill] Phase 2/2 — concatenating "
-                          f"{len(bucket_paths)} sorted buckets (no merge)...")
-
-                concat_bucket_files(bucket_paths, np_dtype, merged_path,
-                                    silent=silent)
-
-                merged = read_qwrite_full(merged_path)
+                t_phase2 = time.perf_counter()
+                merged   = read_qwrite_full(out_path)
                 if reverse:
                     merged = merged[::-1]
                 data[:] = merged
@@ -1169,7 +1230,7 @@ def external_sort(
 
                 t_p2 = time.perf_counter() - t_phase2
                 if not silent:
-                    print(f"  [Quill] Phase 2 complete in {t_p2:.3f}s")
+                    print(f"  [Quill] Load into memory in {t_p2:.3f}s")
                     print(f"  [Quill] Total external sort: {t_p1+t_p2:.3f}s\n")
 
                 return True

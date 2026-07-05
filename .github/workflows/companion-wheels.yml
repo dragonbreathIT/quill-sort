@@ -1,0 +1,140 @@
+name: Companion wheels
+
+# Builds binary wheels for all five quill-sort companion accelerators across
+# Linux (x86_64 + aarch64), macOS (x86_64 + arm64) and Windows, plus an sdist
+# each, and publishes them to PyPI on a GitHub Release.
+#
+# - Pull requests build + smoke-test wheels (no publish) so breakage is caught.
+# - A published Release (or a manual "Run workflow") builds AND publishes.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — no API token lives in CI.
+# One-time setup per project: on PyPI, open each of quill-fastsort,
+# quill-fastsort-parallel, quill-fastsort-ips4o, quill-fastsort-numa,
+# quill-fastsort-simd -> Manage -> Publishing -> "Add a new publisher"
+# (GitHub), with:
+#     Owner:            <your-github-user-or-org>
+#     Repository:       <this-repo-name>
+#     Workflow name:    companion-wheels.yml
+#     Environment:      (leave blank)
+# (A token fallback is shown, commented out, in the publish job.)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "companions/**"
+      - ".github/workflows/companion-wheels.yml"
+
+concurrency:
+  group: companion-wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGES: >-
+    quill-fastsort quill-fastsort-parallel quill-fastsort-ips4o
+    quill-fastsort-numa quill-fastsort-simd
+
+jobs:
+  build_wheels:
+    name: wheels · ${{ matrix.package }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - quill-fastsort
+          - quill-fastsort-parallel
+          - quill-fastsort-ips4o
+          - quill-fastsort-numa
+          - quill-fastsort-simd
+        os:
+          - ubuntu-latest        # Linux x86_64 (manylinux + musllinux)
+          - ubuntu-24.04-arm     # Linux aarch64 (native runner, no QEMU)
+          - macos-13             # macOS x86_64 (native)
+          - macos-14             # macOS arm64 (native)
+          - windows-latest       # Windows AMD64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build + test wheels
+        uses: pypa/cibuildwheel@v2.21.3
+        with:
+          package-dir: companions/${{ matrix.package }}
+          output-dir: wheelhouse
+        # archs default to "auto" (per pyproject) → each runner builds only its
+        # native arch, so there are no cross-build duplicates across jobs.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # "__" delimits fields so a package name that is a prefix of another
+          # (quill-fastsort vs quill-fastsort-parallel) can't cross-match on
+          # download. Package/OS values contain only single hyphens and dots.
+          name: dist__${{ matrix.package }}__${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  build_sdist:
+    name: sdist · ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - quill-fastsort
+          - quill-fastsort-parallel
+          - quill-fastsort-ips4o
+          - quill-fastsort-numa
+          - quill-fastsort-simd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build sdist
+        run: pipx run build --sdist --outdir "$GITHUB_WORKSPACE/sdistout"
+        working-directory: companions/${{ matrix.package }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist__${{ matrix.package }}__sdist
+          path: sdistout/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish · ${{ matrix.package }}
+    needs: [build_wheels, build_sdist]
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      # Publish sequentially so one project's failure doesn't cancel the others.
+      fail-fast: false
+      matrix:
+        package:
+          - quill-fastsort
+          - quill-fastsort-parallel
+          - quill-fastsort-ips4o
+          - quill-fastsort-numa
+          - quill-fastsort-simd
+    permissions:
+      id-token: write        # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - name: Collect this package's wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Matches this package's wheel artifacts (dist__<pkg>__<os>) AND its
+          # sdist (dist__<pkg>__sdist); the trailing "__" prevents matching a
+          # longer package name that shares this prefix.
+          pattern: dist__${{ matrix.package }}__*
+          merge-multiple: true
+
+      - name: Publish ${{ matrix.package }} to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Trusted Publishing (OIDC): no password needed once the PyPI project
+          # trusts this repo + workflow (see header). To use an API token
+          # instead, delete the OIDC setup and uncomment:
+          # password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

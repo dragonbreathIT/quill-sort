@@ -1,0 +1,41 @@
+Metadata-Version: 2.2
+Name: quill-fastsort-simd
+Version: 0.1.0
+Summary: x86-simd-sort (Intel AVX-512) native extension for Quill
+Author: Isaiah Tucker
+License: MIT
+Requires-Python: >=3.8
+Requires-Dist: numpy>=1.21
+Description-Content-Type: text/markdown
+
+# quill-fastsort-simd
+
+Intel `x86-simd-sort` (AVX-512 / AVX2) native extension for QuillSort.
+
+Wraps the same AVX-512 sort kernel that modern NumPy uses internally, exposed
+directly via pybind11 to skip `np.sort` dispatch overhead (~1-2 ms saved per
+call at 1M-10M element sizes) so QuillSort's self-tuning DB can measure it
+independently from the `np.sort` fallback.
+
+## Public Python API
+
+In-place sort, GIL released:
+
+- `sort_i64(arr)`, `sort_u64(arr)`
+- `sort_i32(arr)`, `sort_u32(arr)`
+- `sort_f64(arr)`, `sort_f32(arr)`
+
+Runtime CPU detection (CPUID) picks AVX-512 when available and falls back to
+the AVX2 path otherwise.
+
+## Build
+
+```bash
+export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+python -m pip wheel . -w dist --no-deps --no-build-isolation
+```
+
+## Vendored
+
+`src/x86-simd-sort/` — upstream https://github.com/intel/x86-simd-sort
+(commit `fa944ef`, 2026-06-25).
