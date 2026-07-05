@@ -10,13 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Spectre integer-sort backend (bundled).** A portable, multi-threaded MSD→LSD
   radix sort for 32/64-bit integers ships inside the wheels as `quill._spectre`
   (built from `quill/_native_src/spectre_sort.c`) and joins the self-tuning
-  dispatch chain for integer dtypes (n ≥ 1M, n < 2³²). It is a measured
-  *candidate*, not an override: the dispatcher engages it only in the
-  `(dtype, size)` buckets where it actually wins on your machine and keeps the
-  existing backend everywhere else. Correctness is verified against `numpy.sort`
-  across every integer dtype, range, and edge case; the never-lose fallback is
-  unchanged. (It is C, not C++, so it is a sibling extension to `quill._native`
-  rather than folded into it — both ship in the same binary wheels.)
+  dispatch chain for integer dtypes (n ≥ 1M, n < 2³²). Its min/max/monotone
+  prescan is parallelized across a short-lived thread crew (an exact reduction,
+  so the presorted/reversed/constant/counting fast-paths are unchanged), which
+  removes the single-threaded pass that had been ~⅓ of its overhead. Measured
+  on the reference 24-core box it is now the fastest backend for large
+  bounded-range integers (e.g. int64 20M in the 0…10⁹ range ~1.3× over
+  `rust_voracious`) and at parity on full-range. It is a measured *candidate*,
+  not an override: the dispatcher engages it only in the `(dtype, size)` buckets
+  where it actually wins and keeps the existing backend elsewhere. Correctness is
+  verified against `numpy.sort` across every integer dtype, range, and edge case;
+  the never-lose fallback is unchanged. (It is C, not C++, so it is a sibling
+  extension to `quill._native` rather than folded into it — both ship in the same
+  binary wheels.)
 
 ### Changed
 - **Float sorts skip the NaN pre-scan when the chosen backend orders NaN like

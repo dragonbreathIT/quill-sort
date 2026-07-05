@@ -572,7 +572,119 @@ static int radix_parallel(void *a,int64_t n,uint64_t mn,uint64_t mx,int is_u64,i
     return SPECTRE_OK;
 }
 
-#define DEFINE_SORT(NAME,T,UT,FLIP,IS_U64)                                     \
+/* ============================ PARALLEL PRESCAN ============================
+ * The min/max/monotone prescan in DEFINE_SORT is a full O(n) serial pass and,
+ * on 20M int64, is a big slice of the ~16ms non-kernel overhead. For large n
+ * we split it across a short-lived thread crew: each worker scans a contiguous
+ * slice computing per-slice mn/mx plus internally-nondecreasing (up) and
+ * internally-nonincreasing (down) flags, and records its first/last flipped
+ * value. The main thread reduces: global mn/mx, and global up/down that also
+ * require every slice boundary (last[i] vs first[i+1]) to be ordered. This
+ * reproduces the serial prescan's mn/mx/up/down EXACTLY, so the presorted /
+ * reversed / constant / counting fast-paths keep identical results.
+ *
+ * We spawn our own crew rather than the radix pool because the prescan runs
+ * before we even know whether radix is needed (it may early-out sorted). The
+ * crew is tiny (a handful of threads) and only used for n >= PRESCAN_MIN_N,
+ * where the serial scan cost dwarfs the spawn/join cost. */
+#ifndef PRESCAN_MIN_N
+#define PRESCAN_MIN_N 1048576   /* below this, serial prescan is cheaper than spawn/join */
+#endif
+#define PRESCAN_MAX_T 32
+
+typedef struct {
+    const void *a; int64_t lo, hi;
+    /* results (as flipped-domain u64; u32 types use the low 32 bits) */
+    uint64_t mn, mx, first, last; int up, down;
+    /* which typed scanner to run */
+    int kind;   /* 0=u32,1=i32,2=u64,3=i64 */
+} prescan_arg;
+
+#define PRESCAN_BODY(UT,FLIPV)                                                  \
+    const UT fl=(UT)(FLIPV); const UT *s=(const UT*)pa->a;                      \
+    int64_t lo=pa->lo, hi=pa->hi;                                               \
+    UT f0=(UT)s[lo]^fl, mn=f0, mx=f0, prev=f0; int up=1, down=1;               \
+    for(int64_t i=lo+1;i<hi;i++){ UT f=(UT)s[i]^fl;                             \
+        mn=f<mn?f:mn; mx=f>mx?f:mx; up&=(f>=prev); down&=(f<=prev); prev=f; }  \
+    pa->mn=(uint64_t)mn; pa->mx=(uint64_t)mx;                                   \
+    pa->first=(uint64_t)f0; pa->last=(uint64_t)prev;                           \
+    pa->up=up; pa->down=down;
+
+static void prescan_run(prescan_arg *pa){
+    switch(pa->kind){
+        case 0:{ PRESCAN_BODY(uint32_t, 0u) break; }
+        case 1:{ PRESCAN_BODY(uint32_t, 0x80000000u) break; }
+        case 2:{ PRESCAN_BODY(uint64_t, 0ull) break; }
+        default:{ PRESCAN_BODY(uint64_t, 0x8000000000000000ull) break; }
+    }
+}
+#undef PRESCAN_BODY
+
+#if defined(_WIN32)
+static DWORD WINAPI prescan_thunk(LPVOID p){ prescan_run((prescan_arg*)p); return 0; }
+#else
+static void *prescan_thunk(void *p){ prescan_run((prescan_arg*)p); return NULL; }
+#endif
+
+/* Parallel prescan. Fills *mn_out,*mx_out with the flipped-domain min/max and
+ * returns a monotone code: 0=none, 1=up(nondecreasing), 2=down(nonincreasing).
+ * `kind` selects the type/flip. Falls back to serial for small n or T<=1. */
+static int prescan_parallel(const void *a,int64_t n,int kind,int T,
+                            uint64_t *mn_out,uint64_t *mx_out){
+    if(T>PRESCAN_MAX_T)T=PRESCAN_MAX_T;
+    prescan_arg args[PRESCAN_MAX_T];
+    thr_t th[PRESCAN_MAX_T];
+    int64_t seg=(n+T-1)/T;
+    int spawned=0;
+    /* worker i scans [i*seg, min((i+1)*seg,n)); crew runs [1..T), main does 0 */
+    for(int i=0;i<T;i++){
+        args[i].a=a; args[i].kind=kind;
+        args[i].lo=(int64_t)i*seg; args[i].hi=args[i].lo+seg;
+        if(args[i].hi>n)args[i].hi=n;
+        if(args[i].lo>n)args[i].lo=n;
+    }
+    for(int i=1;i<T;i++){
+        if(args[i].lo>=args[i].hi) continue;   /* empty tail slice, run inline as no-op */
+#if defined(_WIN32)
+        th[i]=CreateThread(NULL,0,prescan_thunk,&args[i],0,NULL);
+        if(!th[i]){ prescan_run(&args[i]); continue; }
+#else
+        if(pthread_create(&th[i],NULL,prescan_thunk,&args[i])){ prescan_run(&args[i]); continue; }
+#endif
+        spawned |= (1<<i);
+    }
+    if(args[0].lo<args[0].hi) prescan_run(&args[0]);
+    for(int i=1;i<T;i++){
+        if(spawned&(1<<i)){
+#if defined(_WIN32)
+            WaitForSingleObject(th[i],INFINITE); CloseHandle(th[i]);
+#else
+            pthread_join(th[i],NULL);
+#endif
+        }
+    }
+    /* reduce: mn/mx across non-empty slices; up/down across slices + boundaries */
+    uint64_t mn=0,mx=0,prev_last=0; int up=1,down=1,have=0;
+    for(int i=0;i<T;i++){
+        if(args[i].lo>=args[i].hi) continue;
+        if(!have){ mn=args[i].mn; mx=args[i].mx; have=1; }
+        else{
+            if(args[i].mn<mn)mn=args[i].mn;
+            if(args[i].mx>mx)mx=args[i].mx;
+            up   &= (prev_last<=args[i].first);   /* boundary must be ordered too */
+            down &= (prev_last>=args[i].first);
+        }
+        up   &= args[i].up;
+        down &= args[i].down;
+        prev_last=args[i].last;
+    }
+    *mn_out=mn; *mx_out=mx;
+    if(up)   return 1;
+    if(down) return 2;
+    return 0;
+}
+
+#define DEFINE_SORT(NAME,T,UT,FLIP,IS_U64,KIND)                                \
 static void ins_##NAME(T *a,int64_t n){                                        \
     for(int64_t i=1;i<n;i++){T x=a[i];int64_t j=i-1;                           \
         while(j>=0&&a[j]>x){a[j+1]=a[j];j--;}a[j+1]=x;}}                       \
@@ -580,12 +692,22 @@ SPECTRE_API int spectre_sort_##NAME(T *a,int64_t n){                            
     if(n<2){g_last_path="trivial";return SPECTRE_OK;}                          \
     if(n<SMALL_N){ins_##NAME(a,n);g_last_path="insertion";return SPECTRE_OK;}  \
     if(n>0xFFFFFFFFll)return SPECTRE_TOO_BIG;                                  \
-    UT f0=(UT)a[0]^(UT)FLIP,mn=f0,mx=f0,prev=f0;int up=1,down=1;               \
-    for(int64_t i=1;i<n;i++){UT f=(UT)a[i]^(UT)FLIP;                           \
-        mn=f<mn?f:mn;mx=f>mx?f:mx;up&=(f>=prev);down&=(f<=prev);prev=f;}       \
-    if(up){g_last_path="presorted";return SPECTRE_OK;}                         \
+    UT mn,mx; int mono;                                                        \
+    if(n>=PRESCAN_MIN_N){                                                      \
+        /* parallel min/max/monotone reduction (bottleneck #1) */             \
+        int Tp=pick_threads(n); if(Tp<2)Tp=2;                                  \
+        uint64_t mnu,mxu;                                                      \
+        mono=prescan_parallel((const void*)a,n,(KIND),Tp,&mnu,&mxu);           \
+        mn=(UT)mnu; mx=(UT)mxu;                                                \
+    }else{                                                                     \
+        UT f0=(UT)a[0]^(UT)FLIP,prev=f0;int up=1,down=1; mn=f0;mx=f0;          \
+        for(int64_t i=1;i<n;i++){UT f=(UT)a[i]^(UT)FLIP;                       \
+            mn=f<mn?f:mn;mx=f>mx?f:mx;up&=(f>=prev);down&=(f<=prev);prev=f;}   \
+        mono = up?1:(down?2:0);                                                \
+    }                                                                          \
+    if(mono==1){g_last_path="presorted";return SPECTRE_OK;}                    \
     if(mn==mx){g_last_path="constant";return SPECTRE_OK;}                      \
-    if(down){for(int64_t i=0,j=n-1;i<j;i++,j--){T t=a[i];a[i]=a[j];a[j]=t;}    \
+    if(mono==2){for(int64_t i=0,j=n-1;i<j;i++,j--){T t=a[i];a[i]=a[j];a[j]=t;} \
         g_last_path="reversed";return SPECTRE_OK;}                             \
     UT range=mx-mn;                                                            \
     if(range<65536u){                                                         \
@@ -605,7 +727,7 @@ SPECTRE_API int spectre_sort_desc_##NAME(T *a,int64_t n){                       
     int rc=spectre_sort_##NAME(a,n);                                         \
     if(rc==SPECTRE_OK) for(int64_t i=0,j=n-1;i<j;i++,j--){T t=a[i];a[i]=a[j];a[j]=t;} \
     return rc;}
-DEFINE_SORT(u32,uint32_t,uint32_t,0u,0)
-DEFINE_SORT(i32,int32_t,uint32_t,0x80000000u,0)
-DEFINE_SORT(u64,uint64_t,uint64_t,0ull,1)
-DEFINE_SORT(i64,int64_t,uint64_t,0x8000000000000000ull,1)
+DEFINE_SORT(u32,uint32_t,uint32_t,0u,0,0)
+DEFINE_SORT(i32,int32_t,uint32_t,0x80000000u,0,1)
+DEFINE_SORT(u64,uint64_t,uint64_t,0ull,1,2)
+DEFINE_SORT(i64,int64_t,uint64_t,0x8000000000000000ull,1,3)
