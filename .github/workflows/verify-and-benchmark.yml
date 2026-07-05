@@ -1,0 +1,162 @@
+name: verify & benchmark (post-merge)
+
+# Runs AFTER EACH MERGE to main (a push to main), before anything else relies on
+# the new code. Order is strict and one-at-a-time:
+#   1. `test`      — the exhaustive correctness gate (tests/, 2000+ cases vs
+#                     numpy.sort / sorted()). If this fails, nothing else runs.
+#   2. `benchmark` — times HEAD vs the PREVIOUS STABLE release (from PyPI) and
+#                     vs numpy on a fixed case set; flags a real regression.
+#   3. `autofix`   — only if `benchmark` found a regression: opens a tracking
+#                     issue and (when ANTHROPIC_API_KEY is set) runs Claude Code
+#                     to investigate and open a fix PR.
+# It is NOT wired to pull_request / arbitrary pushes on purpose — the user wants
+# it per-merge, not per-commit. Trigger a manual run any time with "Run workflow".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "quill/**"
+      - "tests/**"
+      - "bench/**"
+      - "setup.py"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+concurrency:
+  # Serialize per-branch, but DON'T cancel an in-flight run (a running autofix
+  # shouldn't be killed by the next merge).
+  group: verify-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. correctness gate ──────────────────────────────────────────────────────
+  test:
+    name: comprehensive correctness gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with native backends + test deps
+        # QUILL_FORCE_C_EXT=1 makes a failed native build FAIL loudly (a missing
+        # backend would silently shrink coverage). numpy is absent from the
+        # isolated build env, so the two numpy-accel C exts skip gracefully; the
+        # backends (quill._native, quill._spectre) build regardless.
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          QUILL_FORCE_C_EXT=1 python -m pip install -e ".[all,dev]"
+      - name: Report environment
+        run: python -c "import quill, numpy; print('quill', quill.__version__, '| numpy', numpy.__version__); print('backends:', quill.available_backends())"
+      - name: Run the full suite (2000+ cases, incl. slow tier)
+        run: python -m pytest tests/ -q -p no:cacheprovider
+
+  # ── 2. benchmark vs previous stable + numpy ──────────────────────────────────
+  benchmark:
+    name: benchmark vs previous stable + numpy
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      regressed: ${{ steps.compare.outputs.regressed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build HEAD (native backends)
+        run: |
+          python -m pip install --upgrade pip setuptools wheel numpy
+          QUILL_FORCE_C_EXT=1 python -m pip install -e ".[all]"
+      - name: Benchmark HEAD
+        run: python bench/run_bench.py --out head.json
+      - name: Benchmark previous stable (PyPI) in an isolated venv
+        run: |
+          python -m venv /tmp/baseline
+          /tmp/baseline/bin/python -m pip install --upgrade pip
+          # Latest published quill-sort = the previous stable relative to HEAD.
+          /tmp/baseline/bin/python -m pip install "quill-sort" numpy polars
+          /tmp/baseline/bin/python bench/run_bench.py --out baseline.json
+      - name: Compare (regression gate)
+        id: compare
+        run: |
+          if python bench/compare.py head.json baseline.json --report report.md; then
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "regressed=true" >> "$GITHUB_OUTPUT"
+          fi
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            report.md
+            head.json
+            baseline.json
+
+  # ── 3. on regression: ping Claude to fix ─────────────────────────────────────
+  autofix:
+    name: ping Claude to fix the regression
+    needs: benchmark
+    if: needs.benchmark.outputs.regressed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-report
+      - name: Open a tracking issue (durable ping; also triggers the Claude GitHub App if installed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "A post-merge benchmark on \`main\` (commit \`${GITHUB_SHA}\`) detected a **performance regression** vs the previous stable release."
+            echo
+            cat report.md
+            echo
+            echo "---"
+            echo "@claude please investigate and fix this regression. Correctness is non-negotiable — every test in \`tests/\` (2000+ cases vs numpy.sort / sorted()) must stay green. If it turns out to be CI/tuner noise and not reproducible, say so and change nothing."
+          } > body.md
+          gh issue create --title "Perf regression on main (${GITHUB_SHA::7})" --body-file body.md --label "performance" --label "regression" \
+            || gh issue create --title "Perf regression on main (${GITHUB_SHA::7})" --body-file body.md
+      - name: Claude Code — investigate & open a fix PR (only if ANTHROPIC_API_KEY is set)
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            A post-merge performance-regression check on `main` FAILED. The benchmark
+            (`bench/run_bench.py` + `bench/compare.py`) found HEAD slower than the
+            previous stable release. The full report is in `report.md` in the repo root —
+            read it first.
+
+            Your job: investigate and fix the regression, then open a pull request.
+
+            Where to look (Quill's array-sort path):
+              * `quill/_backends.py` — dispatch_sort, backend selection, the self-tuning DB
+              * `quill/_strategies.py` — counting sort / kernel selection
+              * `quill/_core.py` — the list path
+
+            Hard constraints:
+              * Correctness is sacred. `pytest tests/` (especially
+                `tests/test_comprehensive.py`, 2000+ cases against numpy.sort / sorted())
+                MUST still pass. Run it.
+              * Do not weaken the never-lose fallback to numpy.
+              * If, after investigating, the "regression" is not reproducible (CI noise or
+                self-tuning-dispatcher backend variance), do NOT change code — instead
+                explain that in the PR/issue and stop.
+
+            Open a PR titled "Fix perf regression on main" with the fix and a short
+            explanation of the root cause. Keep the change minimal and well-commented.
+          claude_args: "--max-turns 40"
