@@ -50,7 +50,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build + test binary wheels (native backend forced)
-        uses: pypa/cibuildwheel@v2.21.3
+        # v4.1.0: needed for cp314 (Python 3.14) build targets; v2.21.3 predated 3.14.
+        uses: pypa/cibuildwheel@v4.1.0
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
           CIBW_TEST_SKIP: ${{ matrix.test_skip }}
