@@ -87,7 +87,10 @@ quill = ["py.typed", "*.c", "_native_src/*.cpp", "_native_src/*.hpp", "_native_s
 [tool.cibuildwheel]
 # cibuildwheel 4.x requires Python >= 3.9. cp38 (EOL Oct 2024) still installs via
 # the sdist / pure-Python wheel; it just gets no prebuilt binary wheel.
-build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+# cp314 (Python 3.14, stable Oct 2025) needs cibuildwheel >= 3.x — the CI action
+# is pinned to v4.1.0 (see .github/workflows/quill-sort-wheels.yml). The glob
+# ``cp314-*`` matches the standard build only, NOT the free-threaded ``cp314t-*``.
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
 # Skip 32-bit (i686 Linux + win32) and PyPy.
 skip  = "*_i686 pp* *-win32"
 # QUILL_FORCE_C_EXT makes a failed native build FAIL the wheel (a missing backend
