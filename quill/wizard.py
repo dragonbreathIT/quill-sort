@@ -312,7 +312,31 @@ def _detect_cpu() -> Dict[str, Any]:
             if tag in flags:
                 out.append(tag)
         return out
+
+    def _flags_via_numpy() -> List[str]:
+        # Fallback when py-cpuinfo isn't installed (it's an OPTIONAL dep, absent
+        # on a plain ``pip install quill-sort``). numpy — the base fast-path dep —
+        # already detects and exposes the CPU SIMD features it can use, so this
+        # keeps the ISA line honest without another dependency. Without it the
+        # panel used to report "no SIMD features detected" on an obviously
+        # AVX2/AVX-512 box while the x86_simd_sort backend (which keys off the
+        # SAME numpy detection) happily engaged — a self-contradiction.
+        try:
+            from numpy._core._multiarray_umath import __cpu_features__ as feats
+        except Exception:
+            from numpy.core._multiarray_umath import __cpu_features__ as feats  # numpy<2
+        out = []
+        if feats.get("AVX512F"):              out.append("avx512f")
+        if feats.get("AVX2"):                 out.append("avx2")
+        if feats.get("SSE42") or feats.get("SSE4_2"): out.append("sse4_2")
+        if feats.get("ASIMD") or feats.get("NEON"):   out.append("neon")
+        return out
+
+    # py-cpuinfo first (richest), then numpy's detection, then the ARMv8 floor
+    # (every ARMv8 chip has NEON/ASIMD even if a probe missed it).
     flags = _safe(_flags_via_cpuinfo, []) or []
+    if not flags:
+        flags = _safe(_flags_via_numpy, []) or []
     if not flags and info["arch"].lower() in ("arm64", "aarch64"):
         flags = ["neon"]
     info["features"] = flags
@@ -372,6 +396,21 @@ def _detect_gpus() -> List[Dict[str, str]]:
         gpus.append(g)
 
     return gpus
+
+
+def _gpu_present_ignoring_config(hw: Dict[str, Any]) -> bool:
+    """Is a usable NVIDIA GPU present — independent of the current config?
+
+    Used when deciding whether to enable ``use_gpu``. It must NOT consult
+    ``CuPyBackend`` (whose probe is gated on the very ``use_gpu`` flag we're about
+    to set, so a stale ``use_gpu=False`` would make it self-perpetuating). We
+    trust the hardware detection first, then a direct CUDA device-count probe."""
+    if any(g.get("vendor") == "NVIDIA" for g in hw.get("gpus", []) or []):
+        return True
+    def _cuda_devices() -> bool:
+        import cupy as cp  # type: ignore
+        return cp.cuda.runtime.getDeviceCount() >= 1
+    return bool(_safe(_cuda_devices, False))
 
 
 def _detect_numa() -> Dict[str, Any]:
@@ -564,11 +603,30 @@ def _print_hardware(st: _Style, hw: Dict[str, Any],
     else:
         lines.append(f"{st.info('RAM    ')} {st.dim('unknown (install psutil for accurate sensing)')}")
 
+    # Reconcile with what the DISPATCHER actually sees. The hardware probe
+    # (_detect_gpus, via cupy's runtime) and the cupy_gpu backend's own probe
+    # are separate code paths that can disagree — e.g. cupy importable but a
+    # deep property query hiccups, or use_gpu turned off in config. That mismatch
+    # is what produced the "GPU none detected" panel line sitting above a
+    # dispatch ladder that scheduled cupy_gpu. Cross-check so the panel never
+    # contradicts the ladder.
+    gpu_backend = False
+    try:
+        gpu_backend = "cupy_gpu" in available_backends()
+    except Exception:
+        gpu_backend = False
     if gpus:
         for gpu in gpus:
             lines.append(f"{st.info('GPU    ')} {gpu.get('vendor', '?')} - "
                          f"{gpu.get('name', '?')}  "
                          f"{st.dim('(' + gpu.get('toolkit', '?') + ')')}")
+            if not gpu_backend:
+                # Own line so it can't be truncated off the end of the GPU row.
+                lines.append(f"        {st.dim('cupy GPU backend not active — sorting on CPU')}")
+    elif gpu_backend:
+        # Backend probe found a usable CUDA sort even though the descriptive
+        # probe came up empty — report the truth the dispatcher will act on.
+        lines.append(f"{st.info('GPU    ')} {st.dim('CUDA device present (cupy GPU backend active)')}")
     else:
         lines.append(f"{st.info('GPU    ')} {st.dim('none detected (CPU-only sort)')}")
 
@@ -608,33 +666,85 @@ def _print_recommendations(st: _Style, recs: List[Tuple[str, str, str]],
     out("")
 
 
+def _dispatch_ladder_rows() -> Optional[List[Tuple[str, str, str]]]:
+    """Compute the REAL per-(size, dtype) dispatch on this machine by asking the
+    dispatcher itself which backend it uses for representative arrays — not a
+    hardcoded template.
+
+    Earlier versions printed a fixed preference list (``cupy_gpu`` for >1M, etc.)
+    regardless of what was installed or measured, so the ladder could name a
+    backend the machine can't run (a GPU path on a CPU-only box) or disagree with
+    the hardware panel. Driving it from ``dispatch_sort`` + ``_LAST_BACKEND``
+    makes every row ground truth: it can only ever show a backend that actually
+    ran, it reflects the counting-sort fast path and the self-tuning winner, and
+    it honours ``sort_array``'s small-array floor (which routes < _SMALL_ARRAY_N
+    straight to np.sort). Returns None when numpy isn't importable.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    from . import _backends
+    try:
+        from . import _SMALL_ARRAY_N
+    except Exception:
+        _SMALL_ARRAY_N = 200_000
+
+    def probe(arr) -> str:
+        # sort_array sends anything below the small-array floor straight to
+        # np.sort, so report that honestly without invoking the backend chain.
+        if arr.size < _SMALL_ARRAY_N or not _backends.eligible(arr):
+            return "numpy"
+        last = "numpy"
+        # Warm briefly so the self-tuning dispatcher reports its CONVERGED pick
+        # for this (dtype, size) bucket rather than a mid-exploration probe.
+        for _ in range(4):
+            _backends.dispatch_sort(arr.copy())
+            last = _backends._LAST_BACKEND or "numpy"
+        return last
+
+    rng = np.random.default_rng(0)
+
+    def gen(dt, n, bounded=False):
+        dt = np.dtype(dt)
+        if dt.kind in "iu":
+            info = np.iinfo(dt)
+            hi = 100 if bounded else min(info.max, 2 ** 40)
+            lo = 0 if bounded else max(info.min, -(2 ** 40))
+            return rng.integers(lo, hi, n, dtype=dt)
+        return (rng.random(n) * (100 if bounded else 2 ** 20)).astype(dt)
+
+    return [
+        ("n < 200K (small)",      "int / float",   probe(gen(np.int64, 100_000))),
+        ("200K - 2M (medium)",    "int64",         probe(gen(np.int64, 1_000_000))),
+        ("200K - 2M (medium)",    "float64",       probe(gen(np.float64, 1_000_000))),
+        ("> 2M (large)",          "int64",         probe(gen(np.int64, 3_000_000))),
+        ("> 2M (large)",          "float64",       probe(gen(np.float64, 3_000_000))),
+        ("> 2M dense / bounded",  "int (bounded)", probe(gen(np.int64, 3_000_000, bounded=True))),
+    ]
+
+
 def _print_dispatch_ladder(st: _Style, backends: List[str],
                            out: Callable[[str], None]) -> None:
-    """Final 'what will Quill pick' table. We can only show the priority order
-    (the actual size-based crossover lives in the freshly-written config), but
-    that's enough to tell the user what their dispatch looks like."""
+    """Final 'what will Quill actually pick' table, computed live from the
+    dispatcher on representative arrays (see :func:`_dispatch_ladder_rows`) so it
+    reflects THIS machine — never a generic template naming absent backends."""
     lines: List[str] = []
-    lines.append(st.dim("Quill's per-size dispatch on this machine:"))
+    lines.append(st.dim("Quill's per-size dispatch on this machine (measured):"))
     lines.append("")
-    header = f"  {'size class':<22}  {'dtype':<10}  backend"
+    header = f"  {'size class':<22}  {'dtype':<14}  backend"
     lines.append(st.dim(header))
 
-    def _pick(prefer: List[str]) -> str:
-        for b in prefer:
-            if b in backends:
-                return b
-        return backends[0] if backends else "numpy"
-
-    rules = [
-        ("n < 50K (tiny)",       "int / float", _pick(["numpy"])),
-        ("50K - 1M (medium)",    "int64",       _pick(["rust_voracious", "polars", "numpy_parallel", "numpy"])),
-        ("50K - 1M (medium)",    "float64",     _pick(["polars", "rust_voracious", "numpy_parallel", "numpy"])),
-        ("> 1M (large)",         "int64",       _pick(["cupy_gpu", "openmp_simd", "rust_voracious", "polars", "numpy"])),
-        ("> 1M (large)",         "float64",     _pick(["cupy_gpu", "polars", "rust_voracious", "numpy"])),
-        ("> 1M, dense / bounded","int(small range)", _pick(["counting", "rust_voracious", "numpy"])),
-    ]
-    for size, dt, b in rules:
-        lines.append(f"  {size:<22}  {dt:<10}  {st.ok(b)}")
+    rows = _safe(_dispatch_ladder_rows, None)
+    if not rows:
+        lines.append("")
+        lines.append(st.dim("  numpy not installed — correctness via the "
+                            "standard-library Timsort."))
+        out(_box(st, "Dispatch ladder", lines, width=82))
+        out("")
+        return
+    for size, dt, b in rows:
+        lines.append(f"  {size:<22}  {dt:<14}  {st.ok(b)}")
     out(_box(st, "Dispatch ladder", lines, width=82))
     out("")
 
@@ -711,11 +821,20 @@ def _calibrate(st: _Style, hw: Dict[str, Any],
                           else int(DEFAULTS["parallel_min_n"]),
         "parallel_min_cores": 4 if parallel_pays else int(
             DEFAULTS["parallel_min_cores"]),
-        "use_gpu": any(g.get("vendor") == "NVIDIA" for g in hw.get("gpus", [])),
         "calibrated": True,
         # Per-backend first-win thresholds for power users to inspect.
         "backend_thresholds": backend_first_win,
     }
+    # GPU: only ever POSITIVELY enable — never auto-write use_gpu=False. A flaky
+    # descriptive probe (cupy importable but a property query momentarily fails)
+    # previously wrote use_gpu=False, and CuPyBackend then refused to engage a
+    # perfectly good card — a silent, self-perpetuating brick (the next probe,
+    # gated on the now-false config, also fails). The backend's own probe runs a
+    # real sort kernel and disables itself safely on CPU-only boxes, so leaving
+    # use_gpu at its default (True) is correct there. Set True only when a GPU is
+    # actually present (checked independently of the possibly-stale config).
+    if _gpu_present_ignoring_config(hw):
+        delta["use_gpu"] = True
     return delta
 
 

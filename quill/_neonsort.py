@@ -232,6 +232,9 @@ class NeonSortBackend(Backend):
     # arr.sort() (and any future C kernel) sort in place — the dispatcher must
     # copy when ``preserve=True``.
     mutates_input = True
+    # Kernel IS numpy's own ``arr.sort()`` (ASIMD), so NaN is ordered exactly as
+    # np.sort does; dispatch_sort skips its NaN pre-scan for this backend.
+    nan_safe = True
 
     def _probe(self) -> bool:
         if not _NUMPY:

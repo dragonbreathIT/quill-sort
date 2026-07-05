@@ -4,6 +4,52 @@ All notable changes to quill-sort will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.5.0] — 2026-07-05
+
+### Added
+- **Spectre integer-sort backend (bundled).** A portable, multi-threaded MSD→LSD
+  radix sort for 32/64-bit integers ships inside the wheels as `quill._spectre`
+  (built from `quill/_native_src/spectre_sort.c`) and joins the self-tuning
+  dispatch chain for integer dtypes (n ≥ 1M, n < 2³²). Its min/max/monotone
+  prescan is parallelized across a short-lived thread crew (an exact reduction,
+  so the presorted/reversed/constant/counting fast-paths are unchanged), which
+  removes the single-threaded pass that had been ~⅓ of its overhead. Measured
+  on the reference 24-core box it is now the fastest backend for large
+  bounded-range integers (e.g. int64 20M in the 0…10⁹ range ~1.3× over
+  `rust_voracious`) and at parity on full-range. It is a measured *candidate*,
+  not an override: the dispatcher engages it only in the `(dtype, size)` buckets
+  where it actually wins and keeps the existing backend elsewhere. Correctness is
+  verified against `numpy.sort` across every integer dtype, range, and edge case;
+  the never-lose fallback is unchanged. (It is C, not C++, so it is a sibling
+  extension to `quill._native` rather than folded into it — both ship in the same
+  binary wheels.)
+
+### Changed
+- **Float sorts skip the NaN pre-scan when the chosen backend orders NaN like
+  numpy.** `dispatch_sort` now selects the backend *first* and strips NaN only
+  for backends that can't place it natively (the Rust/parallel radix paths). For
+  `numpy` / `x86_simd_sort` / `arm_neon_sort` — whose kernel *is* `np.sort` — the
+  O(n) scan is skipped entirely (measured ~11% faster on float sorts whose best
+  backend is numpy's own kernel), and the self-tuning DB now folds the scan cost
+  into the recorded latency so it converges to the genuinely cheapest backend on
+  float data. Output is bit-identical to `np.sort` (NaN to the end; NaN to the
+  start when descending) for every backend, verified across all-/some-/no-NaN.
+
+### Fixed
+- **`quill setup` hardware detection + dispatch ladder.**
+  - ISA/SIMD features now fall back to numpy's own `__cpu_features__` when
+    `py-cpuinfo` isn't installed, so an AVX2/AVX-512 box no longer reports
+    "no SIMD features detected" while `x86_simd_sort` is happily winning.
+  - The dispatch ladder is now computed from the *actual* dispatcher on
+    representative arrays instead of a hardcoded preference template, so it only
+    ever names backends this machine can really run (no more scheduling
+    `cupy_gpu` on a CPU-only box) and can't contradict the hardware panel.
+  - The wizard no longer auto-writes `use_gpu = false`. A flaky GPU probe could
+    write that and then silently disable a working CUDA card — self-perpetuating,
+    since the backend probe is gated on the flag. It now only ever *enables* the
+    GPU when one is present; CPU-only boxes rely on the backend's own probe,
+    which disables itself safely.
+
 ## [7.4.0] — 2026-07-04
 
 ### Added
