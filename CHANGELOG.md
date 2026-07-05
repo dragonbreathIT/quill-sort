@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [7.5.1] — 2026-07-05
 
+### Performance
+- **`sort_array` now beats `np.sort` from ~25k integer elements** (previously it
+  tied `np.sort` below 200k by deferring to it). Spectre's radix beats numpy's
+  introsort from ~20–25k up (1.1× at 25k → 1.5× at 100k → 2.5×+ past 1M), so the
+  small-array floor is now **dtype-aware**: Spectre-accelerated integers
+  (i32/i64/u32/u64) dispatch from ~25k, while other dtypes (floats — already
+  optimally SIMD-sorted by numpy — and narrow ints) keep the higher `np.sort`
+  floor where the dispatch overhead wouldn't pay. (Below ~20k, and for floats, the
+  best available is still `np.sort`, so those remain ties.)
+- **Self-tuning tie-break no longer flips a genuine backend win to the numpy
+  floor.** The "prefer the floor when it's within 1.1× of the best" tie-break was
+  meant only for numpy-kernel backends (`x86_simd_sort`/`arm_neon_sort` are
+  literally `arr.sort()`); it now fires *only* when the measured winner is one of
+  those. A real compiled kernel (Spectre/rust/ips4o) winning by a hair is no
+  longer discarded on EWMA jitter — which is what had made small/mid-size integer
+  Spectre wins flaky.
+
 ### Fixed
 Correctness fixes for edge cases found by an adversarial fuzz/hunt. Each was a
 *silent* wrong-result or exception mismatch on a **valid** input (no crash, so the

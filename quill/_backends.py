@@ -846,8 +846,13 @@ class SpectreBackend(Backend):
 
     name = "spectre"
     priority = 101          # a-priori top integer candidate (see class docstring)
-    min_n = 1_000_000       # measured clean wins from 1M up; below this, other
-                            # backends / np.sort own the range
+    # Spectre's serial radix beats np.sort from ~20-25k integer elements up (1.07x
+    # at 25k rising to 2.7x by 500k), and its parallel path takes over past ~260k.
+    # The crossover was lowered from 1M to 25k so sort_array uses Spectre — not
+    # np.sort — across the whole mid range, turning former ties into wins. Below
+    # ~20k the Python dispatch overhead (~25us) exceeds the kernel's edge, so
+    # sort_array's small-array floor keeps those on np.sort (see quill/__init__.py).
+    min_n = 25_000
     kinds = "iu"            # integers only — Spectre has no float kernel
     max_itemsize = 8
     mutates_input = True

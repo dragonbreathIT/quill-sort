@@ -92,6 +92,13 @@ _DEFAULT_ABANDON_FACTOR = 2.0
 # kernel. Overridable via load_config()['tuning_tie_factor'] (<=0 disables it).
 _DEFAULT_TIE_FACTOR = 1.1
 
+# Backends whose kernel IS numpy's own ``arr.sort()``. The floor tie-break above
+# only applies when the measured winner is one of these — i.e. jitter between the
+# same underlying kernel. A genuinely different compiled kernel (Spectre / rust /
+# ips4o / …) winning by a hair is a REAL win, not jitter, and must not be flipped
+# to the numpy floor.
+_NUMPY_KERNEL_FAMILY = frozenset({"numpy", "x86_simd_sort", "arm_neon_sort"})
+
 # At most one save per this many seconds. record() is called on every sort and
 # we do not want to fsync the home directory on a microsecond-scale code path.
 _SAVE_INTERVAL_S = 30.0
@@ -428,6 +435,15 @@ class TimingDB:
             # delegating backend and bare np.sort run the SAME numpy kernel on
             # AVX-512 / ASIMD hosts, so their ordering is jitter — pinning to the
             # floor is deterministic and picks the cheapest route to that kernel.
+            #
+            # CRUCIAL SCOPE: this tie-break fires ONLY when the measured winner is
+            # itself a numpy-kernel path (numpy / x86_simd_sort / arm_neon_sort,
+            # all of which are literally arr.sort()). When the winner is a
+            # genuinely DIFFERENT kernel — a compiled radix like Spectre / rust /
+            # ips4o — a close-but-slower floor is NOT the same code, and flipping to
+            # numpy on EWMA jitter would discard a real speedup. (This is what made
+            # small/mid-size Spectre integer wins flaky: a noisy-high Spectre EWMA
+            # sample would land within 1.1x of numpy and get overridden.)
             measured = {nm: ewma[nm] for nm in eligible_names
                         if ewma[nm] is not None}
             if not measured:
@@ -435,7 +451,8 @@ class TimingDB:
             best_nm = min(measured, key=measured.get)
             tie_factor = float(cfg.get("tuning_tie_factor", _DEFAULT_TIE_FACTOR))
             floor_nm = eligible_names[-1]
-            if (floor_nm != best_nm
+            if (best_nm in _NUMPY_KERNEL_FAMILY
+                    and floor_nm != best_nm
                     and floor_nm in measured
                     and tie_factor > 0.0
                     and measured[floor_nm] <= tie_factor * measured[best_nm]):
