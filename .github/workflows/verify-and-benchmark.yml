@@ -1,0 +1,93 @@
+name: verify & benchmark (post-merge)
+
+# Runs AFTER EACH MERGE to main (a push to main), before anything else relies on
+# the new code. Strict order, one job at a time:
+#   1. test      — the exhaustive correctness gate (tests/, 2000+ cases vs
+#                   numpy.sort / sorted()). If this fails, nothing else runs.
+#   2. benchmark — times HEAD vs the PREVIOUS STABLE release (from PyPI) and vs
+#                   numpy, then FAILS THE BUILD on a real regression (a normal
+#                   red X). The report goes to the run summary and a downloadable
+#                   artifact so the cause is visible on the failed run.
+# Not wired to pull_request / arbitrary pushes on purpose — the user wants it
+# per-merge, not per-commit. Trigger a manual run any time with "Run workflow".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "quill/**"
+      - "tests/**"
+      - "bench/**"
+      - "setup.py"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: verify-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. correctness gate ──────────────────────────────────────────────────────
+  test:
+    name: comprehensive correctness gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with native backends + test deps
+        # QUILL_FORCE_C_EXT=1 makes a failed native build FAIL loudly (a missing
+        # backend would silently shrink coverage). numpy is absent from the
+        # isolated build env, so the two numpy-accel C exts skip gracefully; the
+        # backends (quill._native, quill._spectre) build regardless.
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          QUILL_FORCE_C_EXT=1 python -m pip install -e ".[all,dev]"
+      - name: Report environment
+        run: python -c "import quill, numpy; print('quill', quill.__version__, '| numpy', numpy.__version__); print('backends:', quill.available_backends())"
+      - name: Run the full suite (2000+ cases, incl. slow tier)
+        run: python -m pytest tests/ -q -p no:cacheprovider
+
+  # ── 2. benchmark vs previous stable + numpy (fails the build on regression) ──
+  benchmark:
+    name: benchmark vs previous stable + numpy
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build HEAD (native backends)
+        run: |
+          python -m pip install --upgrade pip setuptools wheel numpy
+          QUILL_FORCE_C_EXT=1 python -m pip install -e ".[all]"
+      - name: Benchmark HEAD
+        run: python bench/run_bench.py --out head.json
+      - name: Benchmark previous stable (PyPI) in an isolated venv
+        run: |
+          python -m venv /tmp/baseline
+          /tmp/baseline/bin/python -m pip install --upgrade pip
+          # Latest published quill-sort = the previous stable relative to HEAD.
+          /tmp/baseline/bin/python -m pip install "quill-sort" numpy polars
+          /tmp/baseline/bin/python bench/run_bench.py --out baseline.json
+      - name: Compare — FAIL the build on a real regression
+        # compare.py writes report.md and exits non-zero on a convincing
+        # regression; pipefail propagates that exit code so the step (and the
+        # job) go red like any other failing check.
+        run: |
+          set -o pipefail
+          python bench/compare.py head.json baseline.json --report report.md | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload benchmark report + data (even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            report.md
+            head.json
+            baseline.json

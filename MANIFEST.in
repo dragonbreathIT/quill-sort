@@ -5,6 +5,7 @@ recursive-include quill py.typed
 recursive-include quill/_native_src *.cpp *.hpp *.c *.h
 prune scratch
 prune tests
+prune bench
 prune companions
 prune experiments
 prune build
