@@ -494,7 +494,17 @@ def topk_impl(data, k: int, largest: bool = False, key=None):
                 arr = np.asarray(data)
             except Exception:
                 arr = None
-        if arr is not None and arr.ndim == 1 and arr.dtype.kind in "iuf":
+        # A Python-int list that numpy promoted to float64 (values spanning the
+        # int64/uint64 range share no common integer dtype) would lose precision
+        # on the numpy path — e.g. 2**64-1 and 2**64-2 both collapse to the same
+        # float. Detect that lossy promotion and let the exact heapq/sorted path
+        # below handle it (quill_sort / quill_argsort already avoid this).
+        lossy_int_promo = (
+            arr is not None and arr.dtype.kind == "f" and isinstance(data, list)
+            and any(isinstance(x, int) and abs(int(x)) > 2 ** 53 for x in data)
+        )
+        if (arr is not None and arr.ndim == 1 and arr.dtype.kind in "iuf"
+                and not lossy_int_promo):
             # np.argpartition treats NaN as larger than any number, so a NaN
             # would silently be returned as the "largest" element. Strip NaN
             # from the working array — NaN values are excluded from top-k

@@ -387,11 +387,14 @@ def _polars_available() -> bool:
 
 
 def polars_string_sort(data: list, reverse: bool = False):
-    """Sort a Python list of str (possibly with None) via polars. Returns a NEW
-    list == sorted(data) with None at the END (FRONT if reverse), or None to
-    signal 'not handled' (caller keeps Timsort). polars sorts UTF-8 bytewise,
-    which equals Python codepoint order for every valid string (stress-verified
-    over random unicode incl. astral characters)."""
+    """Sort a Python list of str via polars. Returns a NEW list == sorted(data),
+    or None to signal 'not handled' (caller keeps Timsort). polars sorts UTF-8
+    bytewise, which equals Python codepoint order for every valid string
+    (stress-verified over random unicode incl. astral characters).
+
+    If the list contains ANY None, this returns None (declines) so the Timsort
+    fallback raises the same TypeError sorted() raises on a None+str mix — matching
+    the 7.0.5 contract, rather than letting polars order the None as a SQL null."""
     if not _polars_available():
         return None
     n = len(data)
@@ -410,6 +413,11 @@ def polars_string_sort(data: list, reverse: bool = False):
     try:
         import polars as pl
         s = pl.Series("v", data, dtype=pl.Utf8)
+        # The sampled gate above can miss a None outside the sample; check the
+        # built series directly. Any null (a None, or a value polars couldn't
+        # represent as Utf8) → decline so Timsort/sorted() raises TypeError.
+        if s.null_count():
+            return None
         return s.sort(descending=reverse, nulls_last=not reverse).to_list()
     except Exception:
         return None
@@ -500,6 +508,12 @@ def _argsort_polars_col(col, reverse):
             ser = pl.Series("v", col)
         else:
             ser = pl.Series("v", col, dtype=pl.Utf8)
+        # A None among comparable values makes sorted() raise TypeError; the
+        # sampled gate can miss one outside the sample, so check the series' null
+        # count and decline (→ _argsort_python raises) rather than ordering the
+        # None as a null. Mirrors the polars_string_sort / 7.0.5 contract fix.
+        if ser.null_count():
+            return None
         df = pl.DataFrame({"v": ser}).with_row_index("__i")
         return df.sort("v", descending=reverse, nulls_last=not reverse,
                        maintain_order=True)["__i"].to_list()

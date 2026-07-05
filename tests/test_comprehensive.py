@@ -517,5 +517,78 @@ def test_large_with_nan():
     assert eq(quill.sort_array(a.copy()), np.sort(a))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. regression guards for the confirmed edge-case bugs (deep hunt, 2026-07-05)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("dt", [">i8", ">u8", ">i4", ">u4", ">f8", ">f4"])
+def test_bigendian_array_matches_numpy(dt):
+    # Non-native byte order: compiled radix kernels (spectre/ips4o/rust) read raw
+    # bytes in native order and would silently corrupt a byteswapped buffer.
+    # sort_array must route these to np.sort. (n above spectre's 1M crossover.)
+    rng = np.random.default_rng(7)
+    ndt = np.dtype(dt)
+    n = 1_500_000
+    if ndt.kind == "f":
+        a = (rng.random(n) * 2 ** 30 - 2 ** 29).astype(dt)
+    else:
+        info = np.iinfo(ndt.newbyteorder("="))
+        a = rng.integers(max(info.min, -(2 ** 40)), min(int(info.max), 2 ** 40), n).astype(dt)
+    assert not a.dtype.isnative
+    assert eq(quill.sort_array(a.copy()), np.sort(a))
+
+
+def test_bigendian_forced_backends_never_corrupt():
+    # Forcing a native-buffer backend on a byteswapped array must NOT corrupt it.
+    a = np.random.default_rng(1).integers(-(10 ** 12), 10 ** 12, 1_500_000).astype(">i8")
+    for bk in ("spectre", "rust_voracious", "rust_parallel_radix", "ips4o", "numpy"):
+        if bk in quill.available_backends():
+            assert eq(quill._backends.dispatch_sort(a.copy(), force=bk), np.sort(a)), bk
+
+
+def test_topk_uint64_boundary_no_float_promotion():
+    # A Python-int list spanning int64/uint64 must not be lossily promoted to
+    # float64 (2**64-1 and 2**64-2 would collapse to the same float).
+    data = [2 ** 64 - 1, 2 ** 64 - 2, 0, 5, 2 ** 63 + 1]
+    assert quill.quill_topk(data, 3, largest=True) == sorted(data, reverse=True)[:3]
+    assert quill.quill_topk(data, 3) == sorted(data)[:3]
+    assert quill.quill_topk(data, 10) == sorted(data)          # k>=n branch
+    assert quill.quill_topk(data, 2, largest=True) == [2 ** 64 - 1, 2 ** 64 - 2]
+
+
+def test_quill_sort_multidim_ndarray_matches_sorted():
+    # sorted() raises on a 0-d (TypeError) or multi-dim (ValueError) ndarray;
+    # quill_sort must raise the same class, not silently per-row sort / flatten.
+    for a in (np.array([[3, 1, 2], [9, 7, 8]], dtype=np.int64),
+              np.arange(24).reshape(2, 3, 4).astype(np.int64),
+              np.array([[np.nan, 1.0, 2.0], [9.0, np.nan, 8.0]]),
+              np.array(5)):                                     # 0-d
+        with pytest.raises((ValueError, TypeError)):
+            sorted(a)
+        with pytest.raises((ValueError, TypeError)):
+            quill.quill_sort(a)
+
+
+@pytest.mark.parametrize("n", [99_999, 120_001])   # straddle the 100k polars threshold
+def test_none_in_large_list_raises_like_sorted(n):
+    data = ["m"] * (n // 2) + [None] + ["a"] * (n - n // 2 - 1)
+    with pytest.raises(TypeError):
+        sorted(data)
+    with pytest.raises(TypeError):
+        quill.quill_sorted(data)
+    with pytest.raises(TypeError):
+        sorted(range(len(data)), key=lambda i: data[i])
+    with pytest.raises(TypeError):
+        quill.quill_argsort(data)
+
+
+def test_none_free_large_string_list_still_fast_path():
+    # The polars fast path must remain intact for None-free large string lists.
+    import random
+    big = [f"k{i:06d}" for i in range(120_000)]
+    random.Random(0).shuffle(big)
+    assert quill.quill_sorted(big) == sorted(big)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

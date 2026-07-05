@@ -1067,11 +1067,21 @@ def _pick_backend(arr) -> Optional[Backend]:
 
 
 def eligible(arr) -> bool:
-    """Numeric, contiguous, value-only ndarray that a fast backend may handle."""
+    """Numeric, contiguous, NATIVE-byte-order, value-only ndarray that a fast
+    backend may handle.
+
+    Non-native (byteswapped, e.g. ``'>i8'`` on a little-endian host) buffers are
+    excluded on purpose: the compiled radix kernels (spectre / ips4o / rust /
+    the counting C-ext) read the raw bytes in native order, so a big-endian array
+    would be silently sorted by byte-reversed values — a wrong result that never
+    raises, so the never-lose wrapper wouldn't catch it. ``np.sort`` is
+    byte-order-safe, so non-native arrays fall through to it (see ``dispatch_sort``
+    and ``sort_array``)."""
     return (_NUMPY and isinstance(arr, np.ndarray)
             and arr.ndim == 1
             and arr.dtype.kind in _ELIGIBLE_KINDS
             and arr.dtype.itemsize <= 8
+            and arr.dtype.isnative
             and arr.flags["C_CONTIGUOUS"])
 
 
@@ -1197,6 +1207,18 @@ def dispatch_sort(arr, descending: bool = False, force: Optional[str] = None,
     global _LAST_BACKEND
     debug = bool(os.environ.get("QUILL_BACKEND_DEBUG"))
     is_float = arr.dtype.kind == "f"
+    # Non-native byte order guard. The compiled radix kernels read raw bytes in
+    # native order, so a byteswapped ('>i8', '<f8' on a big-endian host, …) buffer
+    # would be silently sorted by byte-reversed values — wrong, with no exception,
+    # so the never-lose fallback never fires. np.sort orders by logical value
+    # regardless of byte order. eligible() already routes the public sort_array
+    # path here-avoiding; this also covers force= and any direct dispatch_sort
+    # caller. (Rare path — non-native arrays are uncommon — so the extra np.sort
+    # cost is irrelevant.)
+    if not arr.dtype.isnative:
+        _LAST_BACKEND = "numpy"
+        out = np.sort(arr)
+        return np.ascontiguousarray(out[::-1]) if descending else out
     # NaN is stripped LAZILY, and only if the chosen backend can't order it like
     # np.sort (see the deferred block after backend selection). numpy /
     # x86_simd_sort / arm_neon_sort handle NaN natively, so most float sorts skip

@@ -67,7 +67,7 @@ from ._plugins import QuillPlugin, register_plugin, probe_plugins
 from .visualize import visualize, visualize_sort
 from ._sorted_array import SortedArray
 
-__version__ = "7.5.0"
+__version__ = "7.5.1"
 __author__  = "Isaiah Tucker"
 
 

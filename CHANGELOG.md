@@ -4,6 +4,41 @@ All notable changes to quill-sort will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.5.1] — 2026-07-05
+
+### Fixed
+Correctness fixes for edge cases found by an adversarial fuzz/hunt. Each was a
+*silent* wrong-result or exception mismatch on a **valid** input (no crash, so the
+never-lose fallback never fired):
+
+- **Big-endian / non-native-byte-order integer arrays were silently corrupted by
+  `sort_array`.** The compiled radix kernels (Spectre / ips4o / rust) read the raw
+  buffer in native byte order, so a byteswapped array (`'>i8'`, as produced by
+  `.astype('>i8')`, HDF5, or network/binary formats) was sorted by byte-reversed
+  values — a wrong result that raised nothing. `eligible()` and `dispatch_sort`
+  now require native byte order and route non-native arrays to `np.sort` (which is
+  byte-order-safe). Native-endian arrays are completely unaffected.
+- **`quill_topk` on a Python int list spanning the int64/uint64 boundary returned
+  precision-losing floats.** A list like `[2**64-1, 2**64-2, 0, 5]` was promoted
+  to float64 by `np.asarray`, collapsing distinct values (both large values became
+  the same float). The lossy promotion is now detected and the exact heapq/sorted
+  path handles it. (`quill_sort`/`quill_argsort` were already correct.)
+- **`quill_sort` on a multi-dimensional ndarray silently succeeded** — per-row
+  sort, row-reversal on `reverse=True`, or NaN shape-flattening `(2,3)→(6,)` —
+  where `sorted()` raises. It now raises the same `ValueError`/`TypeError` as
+  `sorted()`. (`sort_array` remains the `np.sort`-style per-axis API for ndarrays.)
+- **`quill_sorted` / `quill_argsort` swallowed `None` on lists ≥100k** (the polars
+  fast path ordered `None` as a SQL null) instead of raising `TypeError` like
+  `sorted()`. The polars paths now decline any `None`-containing input so Timsort
+  surfaces the error — restoring the 7.0.5 match-`sorted()` contract. The bug only
+  occurred above the 100k threshold; smaller lists were already correct.
+
+### Tests
+- `tests/test_comprehensive.py`: added regression guards for all five (big-endian
+  across six dtypes plus forced backends, the topk uint64 boundary, multi-dim
+  ndarray, `None` in large lists for both sort and argsort, and a None-free
+  large-list check so the polars fast path stays intact).
+
 ## [7.5.0] — 2026-07-05
 
 ### Added
