@@ -29,16 +29,31 @@ concurrency:
 
 jobs:
   binary_wheels:
-    name: wheels · ${{ matrix.os }}
+    name: wheels · ${{ matrix.os }} (${{ matrix.archs }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-14, windows-latest]
+        include:
+          - os: ubuntu-latest        # Linux x86_64 (manylinux_2_28 + musllinux)
+            archs: auto
+          - os: ubuntu-24.04-arm     # Linux aarch64 (native runner)
+            archs: auto
+          # GitHub is deprecating the Intel macos-13 runners (they queue forever),
+          # so build BOTH mac arches on the arm64 runner: arm64 natively + x86_64
+          # cross-compiled. x86_64 wheels can't run on arm64, so skip their tests.
+          - os: macos-14
+            archs: "arm64 x86_64"
+            test_skip: "*_x86_64"
+          - os: windows-latest       # win_amd64
+            archs: auto
     steps:
       - uses: actions/checkout@v4
       - name: Build + test binary wheels (native backend forced)
         uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+          CIBW_TEST_SKIP: ${{ matrix.test_skip }}
       - uses: actions/upload-artifact@v4
         with:
           name: dist-binary-${{ matrix.os }}
