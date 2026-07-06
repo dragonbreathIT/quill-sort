@@ -28,6 +28,16 @@ Correctness fixes for edge cases found by an adversarial fuzz/hunt. Each was a
 *silent* wrong-result or exception mismatch on a **valid** input (no crash, so the
 never-lose fallback never fired):
 
+- **`quill_sort`/`quill_sorted` left certain periodic integer lists UNSORTED.**
+  `quill_sort([i % 3 for i in range(100000)])` returned the list unchanged. The
+  512-point profiler sample is taken at stride `n // 512`; when that stride is a
+  multiple of the pattern's period the sample is all-identical, so `all_same` came
+  back `True` and the `all_same` branch **skipped the sort entirely** (it was the
+  only sample-based short-circuit that didn't still call `sort()`). It now verifies
+  constancy against the full data before skipping — cheap, since a periodic list
+  fails the check at the first differing element. (Reported by ChatGPT against
+  6.0.18; reproduced and fixed in 7.5.x. Only the list API was affected — the array
+  path uses counting sort.)
 - **Big-endian / non-native-byte-order integer arrays were silently corrupted by
   `sort_array`.** The compiled radix kernels (Spectre / ips4o / rust) read the raw
   buffer in native byte order, so a byteswapped array (`'>i8'`, as produced by

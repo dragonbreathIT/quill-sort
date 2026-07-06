@@ -590,5 +590,38 @@ def test_none_free_large_string_list_still_fast_path():
     assert quill.quill_sorted(big) == sorted(big)
 
 
+@pytest.mark.parametrize("period", [2, 3, 5, 7, 11])
+@pytest.mark.parametrize("n", [1000, 100_000, 200_000])
+def test_periodic_list_not_falsely_detected_constant(period, n):
+    # A periodic list [i % period] can produce an all-identical 512-point profiler
+    # sample when the stride n//512 is a multiple of the period — the old code then
+    # mistook it for a constant array (all_same) and SKIPPED the sort, returning it
+    # unsorted. (ChatGPT-reported against 6.0.18; reproduced in 7.5.x.) Must fully
+    # sort, and the same via the mutating quill_sort.
+    data = [i % period for i in range(n)]
+    assert quill.quill_sorted(data) == sorted(data), (period, n)
+    work = list(data)
+    quill.quill_sort(work)
+    assert work == sorted(data)
+
+
+def test_mostly_constant_list_with_hidden_outlier_sorts():
+    # An all-same sample must be verified against the full data, or a lone
+    # non-constant element (e.g. a tail outlier) is silently left unsorted.
+    for data in ([7] * 200_000 + [3],
+                 [4] * 199_999 + [1],
+                 [(i % 3) - 1 for i in range(300_000)],   # negatives
+                 ([5] * 50_000 + [1] * 50_000) * 2):
+        assert quill.quill_sorted(data) == sorted(data)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("period", [3, 7, 13])
+def test_periodic_list_large_n(period):
+    for n in (1_000_000, 2_000_000):
+        data = [i % period for i in range(n)]
+        assert quill.quill_sorted(data) == sorted(data), (period, n)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

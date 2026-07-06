@@ -323,7 +323,19 @@ def quill_sort_impl(
     if key_fn is _identity:
         # all_same only short-circuits for non-float: a float all-same sample
         # could hide a stray NaN, which must route through the NaN-safe kernel.
-        if p["all_same"] and p.get("dtype") != "float":
+        #
+        # CRITICAL: ``all_same`` comes from the 512-point profiler SAMPLE, and a
+        # periodic list can produce an all-identical sample while not being
+        # constant — e.g. ``[i % 3 for i in range(100000)]`` sampled at stride
+        # ``n//512 == 195`` (a multiple of 3) is all one value, yet the list is
+        # not. Since this branch SKIPS the sort entirely (unlike the asc/desc
+        # branches below, which still call work.sort() and are correct regardless
+        # of the sample), a false positive returns the data UNSORTED. So verify
+        # constancy against the FULL data first. The check is cheap: for a truly
+        # constant list it is one O(n) pass we'd otherwise spend sorting anyway,
+        # and for the periodic case it exits at the first differing element.
+        if (p["all_same"] and p.get("dtype") != "float"
+                and all(x == work[0] for x in work)):
             return finish(_assemble(work, 0, none_count, reverse))
         # Highly-ordered integer data: Timsort detects existing runs and sorts
         # in ~O(n) — far faster than numpy's build+sort+tolist round-trip on
