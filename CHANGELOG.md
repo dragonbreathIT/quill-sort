@@ -4,6 +4,101 @@ All notable changes to quill-sort will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.5.2] — 2026-07-06
+
+### Changed — `None` sorts to the end again (restores the documented contract)
+
+- **`None` values now sort to the END (to the START with `reverse=True`), exactly
+  like `NaN`**, across `quill_sort`, `quill_sorted`, and `quill_argsort`.
+  `quill_topk` treats `None` as a non-value and excludes it (like `NaN`), returning
+  the k smallest/largest *real* elements. This is a deliberate, documented
+  divergence from `sorted([1, None, 2])`, which raises `TypeError`: real-world data
+  has holes, and cleanly collecting them at one end is more useful than a crash —
+  the same bargain Quill already makes for `NaN`.
+
+  ```python
+  quill.quill_sort([3, None, 1, None, 2])       # -> [1, 2, 3, None, None]
+  quill.quill_sort([3, None, 1], reverse=True)  # -> [None, 3, 1]
+  ```
+
+  This behaviour was Quill's original contract (and what the README has always
+  documented). It was removed in 7.0.5 while fixing a genuine bug — the ≥100k
+  polars fast path was ordering `None` as a SQL `NULL` instead of raising — but that
+  fix over-corrected by dropping the whole feature and matching `sorted()`'s
+  `TypeError` everywhere. 7.5.2 restores `None`-to-end the right way: the polars
+  path still declines on nulls (the real bug stays fixed) and falls back to the
+  `None`-aware path, which strips `None` up front, sorts the rest, and reattaches at
+  the correct end.
+
+  **Genuinely-uncomparable data is unaffected:** a mixed `int`/`str` list with no
+  `None` (or a `None`-plus-uncomparable-remainder like `[1, "a", None]`) still
+  raises `TypeError`, exactly like `sorted()`. `None`-to-end never masks dirty data.
+
+  Detection is a single C-level membership scan (`None in data`) with **no copy** on
+  the common `None`-free path, so ordinary sorts pay no measurable cost.
+
+## [7.5.1] — 2026-07-05
+
+### Performance
+- **`sort_array` now beats `np.sort` from ~25k integer elements** (previously it
+  tied `np.sort` below 200k by deferring to it). Spectre's radix beats numpy's
+  introsort from ~20–25k up (1.1× at 25k → 1.5× at 100k → 2.5×+ past 1M), so the
+  small-array floor is now **dtype-aware**: Spectre-accelerated integers
+  (i32/i64/u32/u64) dispatch from ~25k, while other dtypes (floats — already
+  optimally SIMD-sorted by numpy — and narrow ints) keep the higher `np.sort`
+  floor where the dispatch overhead wouldn't pay. (Below ~20k, and for floats, the
+  best available is still `np.sort`, so those remain ties.)
+- **Self-tuning tie-break no longer flips a genuine backend win to the numpy
+  floor.** The "prefer the floor when it's within 1.1× of the best" tie-break was
+  meant only for numpy-kernel backends (`x86_simd_sort`/`arm_neon_sort` are
+  literally `arr.sort()`); it now fires *only* when the measured winner is one of
+  those. A real compiled kernel (Spectre/rust/ips4o) winning by a hair is no
+  longer discarded on EWMA jitter — which is what had made small/mid-size integer
+  Spectre wins flaky.
+
+### Fixed
+Correctness fixes for edge cases found by an adversarial fuzz/hunt. Each was a
+*silent* wrong-result or exception mismatch on a **valid** input (no crash, so the
+never-lose fallback never fired):
+
+- **`quill_sort`/`quill_sorted` left certain periodic integer lists UNSORTED.**
+  `quill_sort([i % 3 for i in range(100000)])` returned the list unchanged. The
+  512-point profiler sample is taken at stride `n // 512`; when that stride is a
+  multiple of the pattern's period the sample is all-identical, so `all_same` came
+  back `True` and the `all_same` branch **skipped the sort entirely** (it was the
+  only sample-based short-circuit that didn't still call `sort()`). It now verifies
+  constancy against the full data before skipping — cheap, since a periodic list
+  fails the check at the first differing element. (Reported by ChatGPT against
+  6.0.18; reproduced and fixed in 7.5.x. Only the list API was affected — the array
+  path uses counting sort.)
+- **Big-endian / non-native-byte-order integer arrays were silently corrupted by
+  `sort_array`.** The compiled radix kernels (Spectre / ips4o / rust) read the raw
+  buffer in native byte order, so a byteswapped array (`'>i8'`, as produced by
+  `.astype('>i8')`, HDF5, or network/binary formats) was sorted by byte-reversed
+  values — a wrong result that raised nothing. `eligible()` and `dispatch_sort`
+  now require native byte order and route non-native arrays to `np.sort` (which is
+  byte-order-safe). Native-endian arrays are completely unaffected.
+- **`quill_topk` on a Python int list spanning the int64/uint64 boundary returned
+  precision-losing floats.** A list like `[2**64-1, 2**64-2, 0, 5]` was promoted
+  to float64 by `np.asarray`, collapsing distinct values (both large values became
+  the same float). The lossy promotion is now detected and the exact heapq/sorted
+  path handles it. (`quill_sort`/`quill_argsort` were already correct.)
+- **`quill_sort` on a multi-dimensional ndarray silently succeeded** — per-row
+  sort, row-reversal on `reverse=True`, or NaN shape-flattening `(2,3)→(6,)` —
+  where `sorted()` raises. It now raises the same `ValueError`/`TypeError` as
+  `sorted()`. (`sort_array` remains the `np.sort`-style per-axis API for ndarrays.)
+- **`quill_sorted` / `quill_argsort` swallowed `None` on lists ≥100k** (the polars
+  fast path ordered `None` as a SQL null) instead of raising `TypeError` like
+  `sorted()`. The polars paths now decline any `None`-containing input so Timsort
+  surfaces the error — restoring the 7.0.5 match-`sorted()` contract. The bug only
+  occurred above the 100k threshold; smaller lists were already correct.
+
+### Tests
+- `tests/test_comprehensive.py`: added regression guards for all five (big-endian
+  across six dtypes plus forced backends, the topk uint64 boundary, multi-dim
+  ndarray, `None` in large lists for both sort and argsort, and a None-free
+  large-list check so the polars fast path stays intact).
+
 ## [7.5.0] — 2026-07-05
 
 ### Added

@@ -35,6 +35,8 @@ CASES = [
     ("f64_uniform_5M",  "float64", 5_000_000, "uniform"),
     ("f32_uniform_5M",  "float32", 5_000_000, "uniform"),
     ("f64_bounded_5M",  "float64", 5_000_000, "bounded"),
+    ("i64_uniform_100k","int64",     100_000, "uniform"),  # small-int win (Spectre crossover)
+    ("i64_uniform_50k", "int64",      50_000, "uniform"),
     ("i64_uniform_200k","int64",     200_001, "uniform"),  # small: numpy-competitiveness
     ("f64_uniform_200k","float64",   200_001, "uniform"),
 ]

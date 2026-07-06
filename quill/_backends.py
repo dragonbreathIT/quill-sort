@@ -846,8 +846,13 @@ class SpectreBackend(Backend):
 
     name = "spectre"
     priority = 101          # a-priori top integer candidate (see class docstring)
-    min_n = 1_000_000       # measured clean wins from 1M up; below this, other
-                            # backends / np.sort own the range
+    # Spectre's serial radix beats np.sort from ~20-25k integer elements up (1.07x
+    # at 25k rising to 2.7x by 500k), and its parallel path takes over past ~260k.
+    # The crossover was lowered from 1M to 25k so sort_array uses Spectre — not
+    # np.sort — across the whole mid range, turning former ties into wins. Below
+    # ~20k the Python dispatch overhead (~25us) exceeds the kernel's edge, so
+    # sort_array's small-array floor keeps those on np.sort (see quill/__init__.py).
+    min_n = 25_000
     kinds = "iu"            # integers only — Spectre has no float kernel
     max_itemsize = 8
     mutates_input = True
@@ -1067,11 +1072,21 @@ def _pick_backend(arr) -> Optional[Backend]:
 
 
 def eligible(arr) -> bool:
-    """Numeric, contiguous, value-only ndarray that a fast backend may handle."""
+    """Numeric, contiguous, NATIVE-byte-order, value-only ndarray that a fast
+    backend may handle.
+
+    Non-native (byteswapped, e.g. ``'>i8'`` on a little-endian host) buffers are
+    excluded on purpose: the compiled radix kernels (spectre / ips4o / rust /
+    the counting C-ext) read the raw bytes in native order, so a big-endian array
+    would be silently sorted by byte-reversed values — a wrong result that never
+    raises, so the never-lose wrapper wouldn't catch it. ``np.sort`` is
+    byte-order-safe, so non-native arrays fall through to it (see ``dispatch_sort``
+    and ``sort_array``)."""
     return (_NUMPY and isinstance(arr, np.ndarray)
             and arr.ndim == 1
             and arr.dtype.kind in _ELIGIBLE_KINDS
             and arr.dtype.itemsize <= 8
+            and arr.dtype.isnative
             and arr.flags["C_CONTIGUOUS"])
 
 
@@ -1197,6 +1212,18 @@ def dispatch_sort(arr, descending: bool = False, force: Optional[str] = None,
     global _LAST_BACKEND
     debug = bool(os.environ.get("QUILL_BACKEND_DEBUG"))
     is_float = arr.dtype.kind == "f"
+    # Non-native byte order guard. The compiled radix kernels read raw bytes in
+    # native order, so a byteswapped ('>i8', '<f8' on a big-endian host, …) buffer
+    # would be silently sorted by byte-reversed values — wrong, with no exception,
+    # so the never-lose fallback never fires. np.sort orders by logical value
+    # regardless of byte order. eligible() already routes the public sort_array
+    # path here-avoiding; this also covers force= and any direct dispatch_sort
+    # caller. (Rare path — non-native arrays are uncommon — so the extra np.sort
+    # cost is irrelevant.)
+    if not arr.dtype.isnative:
+        _LAST_BACKEND = "numpy"
+        out = np.sort(arr)
+        return np.ascontiguousarray(out[::-1]) if descending else out
     # NaN is stripped LAZILY, and only if the chosen backend can't order it like
     # np.sort (see the deferred block after backend selection). numpy /
     # x86_simd_sort / arm_neon_sort handle NaN natively, so most float sorts skip

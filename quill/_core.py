@@ -68,6 +68,11 @@ def _identity(x):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _strip_nones(data):
+    """Remove Nones in one pass. Returns (clean_list, none_count). Fast path: a
+    None-free list is returned UNCHANGED with 0 (no allocation) — the common case
+    pays only one C-level membership scan, not a full copy."""
+    if None not in data:
+        return data, 0
     clean, nones = [], 0
     for x in data:
         if x is None:
@@ -289,22 +294,28 @@ def quill_sort_impl(
             if pk is not None:
                 key_fn = pk
 
+    # ── None handling ─────────────────────────────────────────────────────────
+    # None sorts to the END (to the START on reverse=True), exactly like NaN. This
+    # is a deliberate, documented divergence from ``sorted([1, None, 2])`` (which
+    # raises TypeError on ``1 < None``): real-world data has holes, and cleanly
+    # collecting them at one end is more useful than a crash — the same bargain we
+    # already make for NaN. Identity key only; a keyed sort lets ``key()`` decide,
+    # matching ``sorted(data, key=...)``. Strip BEFORE profiling so the profiler
+    # sees clean data (correct dtype → numeric fast path), then let every return
+    # path's ``_assemble`` reattach the Nones at the right end.
+    #   History: stripped pre-7.0.5, removed in 7.0.5 (over-corrected a real polars
+    #   null bug into dropping the whole feature), RESTORED in 7.5.2 to honour the
+    #   documented contract. ``_strip_nones`` is no-copy when the list is None-free,
+    #   so the common path pays only one C-level membership scan.
+    none_count = 0
+    if key_fn is _identity:
+        work, none_count = _strip_nones(work)
+        if not work:  # empty, or every element was None → just the Nones
+            return finish(_assemble(work, 0, none_count, reverse))
+
     # ── profile ───────────────────────────────────────────────────────────────
     p = _profile(work, key_fn)
     p["n"] = len(work)
-
-    # ── None handling ─────────────────────────────────────────────────────────
-    # CPython contract: ``sorted([1, None, 2])`` raises TypeError because
-    # ``1 < None`` raises. Earlier versions stripped Nones, sorted the rest,
-    # and reattached Nones at the tail — silent fabricated ordering that
-    # diverged from ``sorted()`` and let dirty data slip past type checks
-    # (Bug #3, fixed in 7.0.5). Now: do NOT strip. Any sort path that
-    # ultimately invokes Python comparisons will surface the TypeError the
-    # same way CPython does. ``quill_topk`` already had this correct
-    # behaviour; this restores consistency across the public API.
-    # ``none_count`` is kept as a parameter to ``_assemble`` for API
-    # compatibility, but is now always 0.
-    none_count = 0
 
     # ── tiny lists: Timsort is optimal ────────────────────────────────────────
     # (Strip NaN first for float data — Timsort cannot order NaN correctly,
@@ -323,7 +334,19 @@ def quill_sort_impl(
     if key_fn is _identity:
         # all_same only short-circuits for non-float: a float all-same sample
         # could hide a stray NaN, which must route through the NaN-safe kernel.
-        if p["all_same"] and p.get("dtype") != "float":
+        #
+        # CRITICAL: ``all_same`` comes from the 512-point profiler SAMPLE, and a
+        # periodic list can produce an all-identical sample while not being
+        # constant — e.g. ``[i % 3 for i in range(100000)]`` sampled at stride
+        # ``n//512 == 195`` (a multiple of 3) is all one value, yet the list is
+        # not. Since this branch SKIPS the sort entirely (unlike the asc/desc
+        # branches below, which still call work.sort() and are correct regardless
+        # of the sample), a false positive returns the data UNSORTED. So verify
+        # constancy against the FULL data first. The check is cheap: for a truly
+        # constant list it is one O(n) pass we'd otherwise spend sorting anyway,
+        # and for the periodic case it exits at the first differing element.
+        if (p["all_same"] and p.get("dtype") != "float"
+                and all(x == work[0] for x in work)):
             return finish(_assemble(work, 0, none_count, reverse))
         # Highly-ordered integer data: Timsort detects existing runs and sorts
         # in ~O(n) — far faster than numpy's build+sort+tolist round-trip on
@@ -494,7 +517,17 @@ def topk_impl(data, k: int, largest: bool = False, key=None):
                 arr = np.asarray(data)
             except Exception:
                 arr = None
-        if arr is not None and arr.ndim == 1 and arr.dtype.kind in "iuf":
+        # A Python-int list that numpy promoted to float64 (values spanning the
+        # int64/uint64 range share no common integer dtype) would lose precision
+        # on the numpy path — e.g. 2**64-1 and 2**64-2 both collapse to the same
+        # float. Detect that lossy promotion and let the exact heapq/sorted path
+        # below handle it (quill_sort / quill_argsort already avoid this).
+        lossy_int_promo = (
+            arr is not None and arr.dtype.kind == "f" and isinstance(data, list)
+            and any(isinstance(x, int) and abs(int(x)) > 2 ** 53 for x in data)
+        )
+        if (arr is not None and arr.ndim == 1 and arr.dtype.kind in "iuf"
+                and not lossy_int_promo):
             # np.argpartition treats NaN as larger than any number, so a NaN
             # would silently be returned as the "largest" element. Strip NaN
             # from the working array — NaN values are excluded from top-k
@@ -517,6 +550,14 @@ def topk_impl(data, k: int, largest: bool = False, key=None):
 
     # generic / keyed / non-numeric fallback
     items = data if isinstance(data, list) else list(data)
+    # None is EXCLUDED from top-k, exactly like NaN on the numpy path above:
+    # top-k asks for the k smallest/largest real values, so a hole in the data is
+    # skipped rather than crashing heapq (None < int raises) or masquerading as an
+    # extreme. Identity key only — a keyed top-k lets key() decide, matching
+    # sorted(key=...). (A None-containing list lands here because np.asarray makes
+    # it an object array, which the numpy fast path declines.)
+    if key_fn is _identity and None in items:
+        items = [x for x in items if x is not None]
     n = len(items)
     if k >= n:
         return quill_sort_impl(items[:], key, largest, True, False)

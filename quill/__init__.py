@@ -67,7 +67,7 @@ from ._plugins import QuillPlugin, register_plugin, probe_plugins
 from .visualize import visualize, visualize_sort
 from ._sorted_array import SortedArray
 
-__version__ = "7.5.0"
+__version__ = "7.5.2"
 __author__  = "Isaiah Tucker"
 
 
@@ -91,6 +91,14 @@ __display_version__ = display_version()
 # the sub-millisecond sort itself. Keeps sort_array from ever being meaningfully
 # slower than np.sort on small inputs.
 _SMALL_ARRAY_N = 200_000
+# Integer dtypes (i32/i64/u32/u64) that Spectre's radix accelerates have a MUCH
+# lower crossover: Spectre beats np.sort from ~20-25k elements up, so for those
+# dtypes sort_array dispatches (to Spectre) from here instead of deferring to
+# np.sort — turning the former 25k-200k *ties* into wins. Non-accelerated dtypes
+# (floats, which numpy already SIMD-sorts optimally; narrow ints) keep the higher
+# _SMALL_ARRAY_N floor, where np.sort is the best available and the extra dispatch
+# overhead would only lose.
+_SMALL_INT_N = 25_000
 __all__     = [
     "quill_sort", "quill_sorted", "quill_topk", "quill_argsort", "sort_array",
     "available_backends", "QuillPlugin", "register_plugin", "analyze",
@@ -343,8 +351,14 @@ def sort_array(data, descending: bool = False, inplace: bool = False):
     # Small arrays: the dispatch machinery (dtype probe + backend selection)
     # costs more than a sub-millisecond sort, and no backend engages below its
     # crossover anyway — so go straight to numpy. Keeps sort_array from ever
-    # being meaningfully slower than np.sort on small inputs.
-    if arr.size < _SMALL_ARRAY_N:
+    # being meaningfully slower than np.sort on small inputs. The floor is
+    # dtype-aware: Spectre-accelerated integers (i32/i64/u32/u64) dispatch from
+    # the much lower _SMALL_INT_N (~25k, where Spectre already beats np.sort);
+    # every other dtype keeps the higher _SMALL_ARRAY_N floor.
+    small_floor = (_SMALL_INT_N
+                   if arr.dtype.kind in "iu" and arr.dtype.itemsize in (4, 8)
+                   else _SMALL_ARRAY_N)
+    if arr.size < small_floor:
         if inplace and isinstance(data, np.ndarray) and arr is data \
                 and data.flags["WRITEABLE"]:
             arr.sort()

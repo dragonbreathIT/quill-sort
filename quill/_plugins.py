@@ -266,6 +266,16 @@ class NumpyArrayPlugin(QuillPlugin):
     @staticmethod
     def prepare(data, key, reverse, stable=True):
         import numpy as np
+        if data.ndim != 1:
+            # quill_sort must match sorted(), and sorted() cannot order a
+            # multi-dimensional ndarray: a 0-d array isn't iterable (raises
+            # TypeError) and comparing the 1-d rows of a 2-d+ array yields an
+            # ambiguous truth value (raises ValueError). Hand it the SAME iterable
+            # sorted() would receive — list(data) — so those exceptions surface,
+            # instead of silently per-row sorting / shape-flattening through the
+            # numeric fast path below. (sort_array() remains the np.sort-style
+            # per-axis API for ndarrays.)
+            return list(data), key, None
         if key is None and data.dtype.kind in "iuf":
             # Sort the array directly with Quill's best numeric kernel
             # (counting sort for bounded ints, parallel partition for big
