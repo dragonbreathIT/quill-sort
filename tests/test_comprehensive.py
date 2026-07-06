@@ -260,30 +260,59 @@ def test_quill_sort_key_is_stable(n, reverse):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. None handling — Quill matches sorted() EXACTLY, including raising
-#    TypeError on an uncomparable None+value mix (the 7.0.5 "match CPython"
-#    contract; the old strip-None-to-end behaviour was removed as Bug #3).
-#    NB: the README still shows the OLD None-to-end example — stale doc, tracked
-#    separately. This test pins the ACTUAL contract: parity with sorted().
+# 4. None handling — the DOCUMENTED Quill contract: None sorts to the END (to the
+#    FRONT on reverse), exactly like NaN. This is a deliberate, useful divergence
+#    from sorted(), which raises TypeError on a None+value mix. Real-world data has
+#    holes; cleanly collecting them at one end beats a crash — the same bargain we
+#    already make for NaN. Removed in 7.0.5 (over-correction of a real polars-null
+#    bug), RESTORED in 7.5.2 to honour the README contract users rely on.
+#    Genuinely-uncomparable data (no None, e.g. int+str) STILL raises like sorted().
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("n_none", [0, 1, 3, 10])
 @pytest.mark.parametrize("n_val", [0, 1, 50, 500])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_none_matches_sorted_semantics(n_none, n_val, reverse):
+def test_none_sorts_to_end(n_none, n_val, reverse):
     rng = np.random.default_rng(n_none * 100 + n_val + reverse)
     vals = [int(x) for x in rng.integers(-1000, 1000, n_val)]
     data = vals + [None] * n_none
     rng.shuffle(data)
-    try:
-        expected = sorted(data, reverse=reverse)
-    except TypeError:
-        # sorted() rejects the None+int mix — Quill must reject it identically.
-        with pytest.raises(TypeError):
-            quill.quill_sorted(data, reverse=reverse)
-        return
+    clean = sorted(vals, reverse=reverse)
+    # None to the end (ascending) / the front (reverse) — like NaN.
+    expected = ([None] * n_none + clean) if reverse else (clean + [None] * n_none)
     assert quill.quill_sorted(data, reverse=reverse) == expected, \
         f"none={n_none} val={n_val} rev={reverse}"
+    # quill_sort in-place must land on the same order.
+    inplace = list(data)
+    quill.quill_sort(inplace, reverse=reverse)
+    assert inplace == expected
+    # applying the argsort permutation reproduces the same values.
+    idx = quill.quill_argsort(data, reverse=reverse)
+    assert [data[i] for i in idx] == expected
+
+
+def test_none_plus_uncomparable_still_raises():
+    # None strips to the end, but a genuinely uncomparable REMAINDER (int+str)
+    # must still raise TypeError exactly like sorted() — None-to-end must never
+    # mask dirty, truly-uncomparable data.
+    for bad in ([1, "a", None], [None, 1, "a", 2] * 40):
+        with pytest.raises(TypeError):
+            quill.quill_sorted(bad)
+        with pytest.raises(TypeError):
+            quill.quill_argsort(bad)
+
+
+def test_none_with_nan_both_to_end():
+    # NaN and None both sort to the end, NaN before None (ascending); mirrored on
+    # reverse. NaN is compared with `is`/`!=` since nan != nan.
+    import math
+    data = [3.0, None, math.nan, 1.0, None, 2.0]
+    out = quill.quill_sorted(data)
+    assert out[:3] == [1.0, 2.0, 3.0]
+    assert math.isnan(out[3]) and out[4:] == [None, None]
+    rout = quill.quill_sorted(data, reverse=True)
+    assert rout[:2] == [None, None] and math.isnan(rout[2])
+    assert rout[3:] == [3.0, 2.0, 1.0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,6 +329,18 @@ def test_topk_matches_sorted_slice(n, k, largest):
     got = quill.quill_topk(data, kk, largest=largest)
     expected = sorted(data, reverse=largest)[:kk]
     assert got == expected, f"n={n} k={k} largest={largest}"
+
+
+@pytest.mark.parametrize("largest", [False, True])
+def test_topk_excludes_none(largest):
+    # None is EXCLUDED from top-k, exactly like NaN — top-k asks for the k
+    # smallest/largest REAL values, so a hole in the data is skipped, never
+    # returned as an extreme and never crashing heapq.
+    data = [3, None, 1, None, 5, 2, None, 4]
+    clean = sorted((x for x in data if x is not None), reverse=largest)
+    assert quill.quill_topk(data, 3, largest=largest) == clean[:3]
+    # k larger than the real-value count → just the real values, sorted.
+    assert quill.quill_topk(data, 99, largest=largest) == clean
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,16 +611,16 @@ def test_quill_sort_multidim_ndarray_matches_sorted():
 
 
 @pytest.mark.parametrize("n", [99_999, 120_001])   # straddle the 100k polars threshold
-def test_none_in_large_list_raises_like_sorted(n):
+def test_none_in_large_list_sorts_to_end(n):
+    # None-to-end must hold ABOVE the polars fast-path threshold too: the polars
+    # path declines on nulls (it would order them as SQL nulls) and falls back to
+    # the None-aware Timsort path. sorted() itself would raise TypeError here.
     data = ["m"] * (n // 2) + [None] + ["a"] * (n - n // 2 - 1)
-    with pytest.raises(TypeError):
-        sorted(data)
-    with pytest.raises(TypeError):
-        quill.quill_sorted(data)
-    with pytest.raises(TypeError):
-        sorted(range(len(data)), key=lambda i: data[i])
-    with pytest.raises(TypeError):
-        quill.quill_argsort(data)
+    clean = sorted(x for x in data if x is not None)
+    assert quill.quill_sorted(data) == clean + [None]
+    assert quill.quill_sorted(data, reverse=True) == [None] + clean[::-1]
+    idx = quill.quill_argsort(data)
+    assert [data[i] for i in idx] == clean + [None]
 
 
 def test_none_free_large_string_list_still_fast_path():

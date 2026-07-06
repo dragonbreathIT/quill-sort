@@ -4,6 +4,39 @@ All notable changes to quill-sort will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [7.5.2] — 2026-07-06
+
+### Changed — `None` sorts to the end again (restores the documented contract)
+
+- **`None` values now sort to the END (to the START with `reverse=True`), exactly
+  like `NaN`**, across `quill_sort`, `quill_sorted`, and `quill_argsort`.
+  `quill_topk` treats `None` as a non-value and excludes it (like `NaN`), returning
+  the k smallest/largest *real* elements. This is a deliberate, documented
+  divergence from `sorted([1, None, 2])`, which raises `TypeError`: real-world data
+  has holes, and cleanly collecting them at one end is more useful than a crash —
+  the same bargain Quill already makes for `NaN`.
+
+  ```python
+  quill.quill_sort([3, None, 1, None, 2])       # -> [1, 2, 3, None, None]
+  quill.quill_sort([3, None, 1], reverse=True)  # -> [None, 3, 1]
+  ```
+
+  This behaviour was Quill's original contract (and what the README has always
+  documented). It was removed in 7.0.5 while fixing a genuine bug — the ≥100k
+  polars fast path was ordering `None` as a SQL `NULL` instead of raising — but that
+  fix over-corrected by dropping the whole feature and matching `sorted()`'s
+  `TypeError` everywhere. 7.5.2 restores `None`-to-end the right way: the polars
+  path still declines on nulls (the real bug stays fixed) and falls back to the
+  `None`-aware path, which strips `None` up front, sorts the rest, and reattaches at
+  the correct end.
+
+  **Genuinely-uncomparable data is unaffected:** a mixed `int`/`str` list with no
+  `None` (or a `None`-plus-uncomparable-remainder like `[1, "a", None]`) still
+  raises `TypeError`, exactly like `sorted()`. `None`-to-end never masks dirty data.
+
+  Detection is a single C-level membership scan (`None in data`) with **no copy** on
+  the common `None`-free path, so ordinary sorts pay no measurable cost.
+
 ## [7.5.1] — 2026-07-05
 
 ### Performance

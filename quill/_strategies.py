@@ -423,12 +423,10 @@ def polars_string_sort(data: list, reverse: bool = False):
         return None
 
 
-def _argsort_special(v) -> bool:
-    # NaN only — None is no longer a "special" sentinel (Bug #3, fixed in
-    # 7.0.5). CPython's ``sorted([1, None, 2])`` raises TypeError; argsort
-    # now matches by leaving None on the normal comparison path so the
-    # underlying ``sorted()`` surfaces the same exception. NaN handling
-    # stays: numpy-style "NaN at end" is documented and intentional.
+def _is_nan(v) -> bool:
+    # ``x != x`` is True only for NaN (any float type). Kept separate from the
+    # None check so the two sentinel groups can be reattached in a stable,
+    # documented order (values, then NaN, then None — see _argsort_python).
     return type(v) is float and v != v
 
 
@@ -522,10 +520,21 @@ def _argsort_polars_col(col, reverse):
 
 
 def _argsort_python(col, reverse):
-    n = len(col)
-    normal = [i for i in range(n) if not _argsort_special(col[i])]
-    specials = [i for i in range(n) if _argsort_special(col[i])]
-    # Uncomparable keys make sorted() raise TypeError — let it propagate,
-    # matching Python exactly (never silently wrong).
+    # Three-way partition so None and NaN both sort to the END (to the FRONT on
+    # reverse), matching the documented contract AND the list path's _assemble
+    # ordering (values, then NaN, then None ascending; the mirror on reverse).
+    # Both sentinel groups keep their original relative order → the permutation
+    # is stable. Everything else goes through the normal comparison, so a genuinely
+    # uncomparable mix (e.g. int + str) still raises TypeError exactly like sorted().
+    normal, nans, nones = [], [], []
+    for i, x in enumerate(col):
+        if x is None:
+            nones.append(i)
+        elif _is_nan(x):
+            nans.append(i)
+        else:
+            normal.append(i)
     order = sorted(normal, key=lambda i: col[i], reverse=reverse)
-    return (specials + order) if reverse else (order + specials)
+    if reverse:
+        return nones + nans + order
+    return order + nans + nones

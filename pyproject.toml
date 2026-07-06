@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "quill-sort"
-version         = "7.5.1"
+version         = "7.5.2"
 description     = "Adaptive sorting that auto-dispatches to the fastest available backend (compiled, GPU, parallel) with a guaranteed numpy/Timsort fallback; Quill.UltraSort engine for billion-element integer workloads."
 readme          = "README.md"
 license         = { text = "MIT" }

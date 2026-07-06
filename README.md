@@ -255,14 +255,24 @@ QUILL_BACKEND_DEBUG=1 python your_script.py
 
 ## Correctness contract
 
-Quill's output matches `sorted()` and `numpy.sort` on every supported input.
+Quill's output matches `sorted()` and `numpy.sort` on every supported input, with
+two deliberate, more-useful exceptions: **`None` and `NaN` sort cleanly to the end**
+(to the start with `reverse=True`) instead of raising. Real-world data has holes;
+collecting them at one end beats a crash. Genuinely-uncomparable data — a mixed
+`int`/`str` list with no `None` involved — still raises `TypeError`, exactly like
+`sorted()`.
 
-`None` values sort to the end (to the start with `reverse=True`):
+`None` values sort to the end (to the start with `reverse=True`), where
+`sorted([3, None, 1])` would raise:
 
 ```python
 quill.quill_sort([3, None, 1, None, 2])
 # -> [1, 2, 3, None, None]
 ```
+
+This applies uniformly across `quill_sort`, `quill_sorted`, and `quill_argsort`;
+`quill_topk` excludes `None` (and `NaN`) as non-values, returning the k smallest or
+largest real elements.
 
 `NaN` values in float data sort to the end (to the start with `reverse=True`),
 matching numpy:
